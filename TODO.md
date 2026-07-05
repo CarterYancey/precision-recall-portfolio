@@ -1,0 +1,34 @@
+# TODO / recommended improvements
+
+## Correctness bugs
+
+- [ ] **`simulate_custom_portfolio_distribution` ignores its `benchmark_return` argument** (`pickn.py`): the line `benchmark_return = 0.1` overwrites the actual SPY return for the year, so stocks are labeled "positive" against a fixed 10% threshold instead of that year's benchmark. Remove the hardcode (or make the threshold an explicit parameter).
+- [ ] **Early `break` skews the simulated distribution** (`simulate_custom_portfolio_distribution`): when one draw's achieved metrics fall outside the ±0.1 tolerance, the loop appends `None` and `break`s, abandoning the remaining simulations. Since achieved metrics are deterministic given the label counts (only the sampled names vary), either validate feasibility once before the loop or `continue` instead of `break`.
+- [ ] **`summary` rows embed whole Series**: `run_top_n_study` puts `custom_stats["achieved_recall"]`/`["achieved_precision"]` (per-year Series) into scalar summary cells, which is why `Precision_Recall_Tradeoff.csv` contains stringified sets like `"{0.13, 0.14, ...}"`. Store per-year values in `custom_stats` and aggregate them (e.g. mean/min/max) for the summary instead.
+- [ ] **`bottom_n_portfolio_return` docstring** says "top-n" — copy-paste error.
+- [ ] **Stale module docstring in `pickn.py`**: it still says "Uses *current* S&P 500 constituents from Wikipedia by default -> survivorship bias", but the default is now the point-in-time historical CSV.
+
+## Robustness / data quality
+
+- [ ] **Cache validation in `download_adj_close`** checks tickers only, not the date range; a cache built for 2012–2024 silently truncates a 2000–2024 request. Validate date coverage (and consider a per-ticker incremental update rather than full re-download when one ticker is missing).
+- [ ] **Intra-year membership changes are ignored**: `get_sp500_tickers_by_year` uses only the first snapshot of each year. Consider using membership as of each year's first trading day, or handling additions/removals mid-year.
+- [ ] **Missing-data handling**: delisted tickers with no yfinance history are silently dropped, which re-introduces survivorship bias into the "point-in-time" study. At minimum, log how many tickers per year had no data; ideally source delisted-stock prices elsewhere.
+- [ ] `datetime.utcnow()` in `constituents.py` is deprecated since Python 3.12 — use `datetime.now(timezone.utc)`.
+- [ ] `constituents.py` and `pickn.py` are disconnected: `pickn.py` reads the committed CSV while `constituents.py` writes its own cache format (`year,ticker` rows). Either wire `get_sp500_tickers_by_year` to accept the constituents cache, or document `constituents.py` as a data-regeneration tool.
+
+## Features / analysis (original planned enhancements)
+
+- [ ] Sweep across multiple recall and precision values to understand performance sensitivity. *(Partially done: `sweep_recall_precision_pairs` exists, but its output is hard to use until the summary-cell issue above is fixed, and it redundantly re-runs the full study — including top-N computation — per grid cell.)*
+- [ ] Compute total expected returns and their variance for the hypothetical model-driven portfolios to quantify the recall/precision needed for consistent outperformance (hypothesis: sufficiently high precision can beat the market even with low recall).
+- [ ] Add transaction-cost / turnover assumptions to make the simulated portfolios more realistic.
+- [ ] Consider cap-weighted (not just equal-weighted) portfolio variants.
+- [ ] Plot the recall/precision sweep as a heatmap (precision × recall → q05 CAGR vs. benchmark).
+
+## Engineering hygiene
+
+- [ ] Add a test suite (start with `simulate_model.py` — it's pure and fast: feasibility edge cases, rounding scheme, `estimate_num_ways` counts).
+- [ ] Add a CLI (argparse) to `pickn.py` instead of editing the `__main__` block to change `n_values`/years/recall/precision.
+- [ ] Commit a `uv.lock` for reproducible environments.
+- [ ] Fill in the `description` field in `pyproject.toml` (currently "Add your description here").
+- [ ] Add a LICENSE file.
+- [ ] Remove commented-out debug prints in `simulate_custom_portfolio_distribution` and the commented bottom-N plotting block in `plot_results` once decisions are final.

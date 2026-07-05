@@ -1,70 +1,100 @@
+# pickN simulation — precision/recall portfolio study
+
 ## Overview
 
-The **pickN_simulation** project explores how portfolios composed of the top-performing S&P 500 stocks compare to an SPY benchmark across calendar years. It also contains utilities for simulating selections that target specific recall/precision trade-offs and for labeling tickers by yearly SPY outperformance.
+This project explores how portfolios composed of the top-performing S&P 500 stocks compare to an SPY benchmark across calendar years, and how good a stock-picking model would need to be (in precision/recall terms) to beat the market. It contains utilities for simulating model selections that target specific recall/precision trade-offs and for labeling tickers by yearly SPY outperformance.
 
-The repository currently includes:
+**Core question:** if a hypothetical model picks stocks with recall *r* and precision *p* (where "positive" means "beat SPY that year"), what distribution of portfolio returns does it achieve — and what (*r*, *p*) is enough to consistently outperform?
 
-- `pickn.py`: downloads year-specific S&P 500 constituent prices, computes top-N/bottom-N/custom-N yearly returns, and plots them against SPY.
-- `simulate_model.py`: simulates model selections with requested recall and precision, returning the achieved metrics and combinatorial counts of possible selections.
-- Pre-generated plots (`topN_vs_spy.png`, `topAndBottomN_vs_spy.png`, `topAndCustomN_vs_spy.png`) and S&P 500 constituent lists.
+## Repository layout
+
+| Path | What it is |
+|------|------------|
+| `pickn.py` | Main study: downloads year-specific S&P 500 constituent prices, computes top-N/bottom-N/model-simulated yearly returns, and plots them against SPY. Also home of `simulate_year_model_selection` and `sweep_recall_precision_pairs`. |
+| `simulate_model.py` | Standalone module: `simulate_selection` constructs a random selection hitting a requested (recall, precision) on labeled tabular data; `estimate_num_ways` counts the combinatorial ways such a selection can exist. No market-data dependencies. |
+| `constituents.py` | Optional utility (not imported by the other scripts): fetches point-in-time S&P 500 membership from historical Wikipedia revisions and caches it to `sp500_constituents_wikipedia_by_year.csv`. Run as a CLI: `uv run python constituents.py --year-start 2000 --year-end 2024`. |
+| `SP500_HistoricalComponents_withChanges.csv` | **Large (~5.3 MB, ~2,700 rows).** Point-in-time S&P 500 membership, 1996-01-02 through 2025-11-11. One row per change date; columns are `date` and `tickers` (a single comma-separated string of ~500 tickers). Used by `get_sp500_tickers_by_year` to reduce survivorship bias. Don't open it casually — see `CLAUDE.md`. |
+| `SP500Current.csv` | Current S&P 500 ticker list (one `Symbol` column, ~505 rows). Used by `get_sp500_tickers_from_csv` as a simpler, survivorship-biased universe. |
+| `Precision_Recall_Tradeoff.csv` | Output of `sweep_recall_precision_pairs`: for each (recall, precision) pair, the 5th-percentile CAGR of the simulated portfolios vs. the benchmark CAGR. |
+| `adj_close_cache.csv` | Generated at runtime (gitignored). Cached adjusted-close prices from yfinance. |
+| `*.png` | Generated at runtime (gitignored). `topNAndCustom_vs_spy.png` (yearly returns) and `topNAndCustom_growth.png` (growth of $100). |
+| `TODO.md` | Known issues and planned improvements. |
+| `CLAUDE.md` | Notes for AI coding assistants working in this repo. |
 
 ## Setup
 
-1. Sync dependencies with `uv` (creates/uses `.venv` automatically):
+Requires Python >= 3.12.
+
+1. Sync dependencies with [`uv`](https://docs.astral.sh/uv/) (creates/uses `.venv` automatically):
    ```bash
    uv sync
    ```
-2. Activate the environment if you prefer to run scripts directly:
-   ```bash
-   source .venv/bin/activate
-   ```
-   You can also prefix commands with `uv run` instead of activating, e.g. `uv run python pickn.py`.
+2. Either activate the environment (`source .venv/bin/activate`) or prefix commands with `uv run`, e.g. `uv run python pickn.py`.
+
+Without `uv`, a plain `pip install yfinance pandas numpy matplotlib lxml html5lib requests` into any 3.12+ environment also works.
 
 ## Running the top-N study
-
-Execute `pickn.py` to download data (via `yfinance`), run the study, and generate a plot:
 
 ```bash
 uv run python pickn.py
 ```
 
-By default the script:
-- Uses year-specific S&P 500 membership from `SP500_HistoricalComponents_withChanges.csv` to reduce survivorship bias.
-- Compares multiple `n_values` (configured near the bottom of the script) against the SPY benchmark.
-- Runs repeated model simulations to summarize custom portfolio return distributions (mean, std, 5–95% band).
-- Saves a plot to `topAndCustomN_vs_spy.png` and prints summary tables to stdout.
+The first run downloads price data from yfinance for every historical constituent (thousands of tickers) — expect it to take a while and produce a large `adj_close_cache.csv`. Subsequent runs load from the cache.
 
-To customize the analysis, adjust the parameters passed to `run_top_n_study` in `pickn.py` (e.g., change `n_values`, `year_start`/`year_end`, or supply your own ticker universe). You can also provide `tickers_by_year` to override the per-year membership, or a fixed `tickers` list for backward compatibility.
+As configured in the `__main__` block, the script:
+
+- Uses year-specific S&P 500 membership from `SP500_HistoricalComponents_withChanges.csv` (first membership snapshot of each year) to reduce survivorship bias.
+- Studies years **2012–2024** with `n_values = [100, 250]` against the SPY benchmark.
+- Runs repeated model simulations (default: recall 0.2, precision 0.7, up to 1000 draws per year) to summarize the simulated portfolio's return distribution (mean, std, 5–95% band).
+- Prints an N-level summary table and recent yearly metrics to stdout.
+- Saves two plots: `topNAndCustom_vs_spy.png` (yearly returns with the simulated-model band) and `topNAndCustom_growth.png` (value of $100 reinvested annually).
+
+To customize, edit the `__main__` block or call `run_top_n_study` yourself — key parameters are `n_values`, `year_start`/`year_end`, `model_recall`/`model_precision`, and `num_simulations`. You can supply `tickers_by_year` to override per-year membership, or a fixed `tickers` list to use a static universe.
+
+## Sweeping recall/precision pairs
+
+`sweep_recall_precision_pairs` in `pickn.py` evaluates a grid of (recall, precision) pairs, reporting for each whether the 5th-percentile CAGR of the simulated portfolios meets or exceeds the benchmark CAGR. Results are printed and written to `Precision_Recall_Tradeoff.csv`.
+
+```bash
+uv run python -c "
+from pickn import sweep_recall_precision_pairs
+sweep_recall_precision_pairs([0.1, 0.2, 0.3], [0.5, 0.6, 0.7, 0.8, 0.9])
+"
+```
+
+Note this re-runs the full study per grid cell, so it is slow on the first (uncached) run.
 
 ## Simulating recall/precision selections
 
-`simulate_model.py` provides `simulate_selection` for exploring achievable recall/precision pairs on tabular data. A minimal example is included in the module’s `__main__` block:
+`simulate_model.py` provides `simulate_selection` for exploring achievable recall/precision pairs on any labeled tabular data. A minimal example is included in the module's `__main__` block:
 
 ```bash
-python simulate_model.py
+uv run python simulate_model.py
 ```
 
-This prints the requested vs. achieved metrics, the sampled names, and the number of combinatorial ways a selection can satisfy the request under the rounding scheme documented in the module docstrings.
+This prints the requested vs. achieved metrics, the sampled names, and the number of combinatorial ways a selection can satisfy the request under the rounding scheme documented in the module docstrings. Infeasible requests either raise (`strict=True`) or return a best-effort selection with an explanatory `note`.
 
 ### Labeling a year by SPY outperformance
 
-Use `simulate_year_model_selection` in `simulate_model.py` to build a yearly dataset where each ticker is labeled `TRUE` when its calendar-year return beats SPY, and then run the selection simulation:
+Use `simulate_year_model_selection` in **`pickn.py`** to build a yearly dataset where each ticker is labeled `TRUE` when its calendar-year return beats SPY, then run the selection simulation:
 
 ```bash
 uv run python -c "from pickn import simulate_year_model_selection; print(simulate_year_model_selection(2010, recall=.1, precision=.9, cache_path='adj_close_cache.csv'))"
 ```
 
-This helper downloads adjusted close prices for the requested tickers/year, computes calendar-year returns, labels tickers by benchmark outperformance, and returns a `SimulationResult`.
+This downloads adjusted-close prices for that year's constituents, computes calendar-year returns, labels tickers by benchmark outperformance, and returns a `SimulationResult`.
 
 ## Caching adjusted close data
 
-`download_adj_close` accepts a `cache_path` (default `adj_close_cache.csv`). When the cache file exists and contains the required tickers/date range, the data is loaded locally instead of re-downloading from `yfinance`. When the cache is missing or insufficient, the download runs and the adjusted close data is persisted for reuse.
+`download_adj_close` accepts a `cache_path` (default `adj_close_cache.csv`). When the cache file exists and contains **all requested tickers**, data is loaded locally and sliced to the requested date range instead of re-downloading from yfinance. Note the check is ticker-based only — if the cached file covers a narrower date range than requested, you'll silently get the narrower range (delete the cache to force a fresh download). When any ticker is missing, the full download runs and overwrites the cache.
 
 ## Notes and caveats
 
-- `yfinance` is used for historical price data; results depend on data availability and may vary slightly over time.
+- yfinance is the price source; results depend on data availability and may vary slightly over time. Delisted/renamed tickers from the historical membership file often have no data and are silently dropped from that year's universe.
+- "Top-N" portfolios are formed **ex post** (with hindsight) — they are an upper bound, not a strategy.
+- The simulated-model labels in `simulate_custom_portfolio_distribution` currently use a hardcoded 10% return threshold rather than the actual SPY return for the year (see `TODO.md`).
+- This is research code, not investment advice.
 
-## Planned enhancements
+## Future work
 
-1. Sweep across multiple recall and precision values to understand performance sensitivity.
-2. Compute total expected returns and their variance for the hypothetical model-driven portfolios to quantify the recall/precision needed for consistent outperformance (hypothesis: sufficiently high precision can beat the market even with low recall).
+See [`TODO.md`](TODO.md) for known issues and planned enhancements.
