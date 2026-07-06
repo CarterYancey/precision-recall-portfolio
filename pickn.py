@@ -64,6 +64,36 @@ def get_sp500_tickers_by_year(path="SP500_HistoricalComponents_withChanges.csv")
         tickers_by_year[int(row["date"].year)] = tickers
     return tickers_by_year
 
+def cache_covers_dates(
+    cached_index: pd.DatetimeIndex,
+    start: str,
+    end: str,
+    *,
+    tolerance: pd.Timedelta = pd.Timedelta(days=7),
+    today: Optional[pd.Timestamp] = None,
+) -> bool:
+    """
+    True if a cache whose (trading-day) index spans [min, max] covers the
+    requested [start, end) window.
+
+    The cache holds trading days only, so exact endpoint matches are not
+    possible: the first trading day on/after `start` can fall a few days
+    later (weekends, New Year holidays), and the last trading day is
+    strictly before the exclusive `end`. `tolerance` absorbs that calendar
+    slack; a gap beyond it means the cache was built for a narrower period.
+    A requested `end` in the future is clamped to `today`, since no cache
+    can contain prices that don't exist yet.
+    """
+    if len(cached_index) == 0:
+        return False
+    today = pd.Timestamp.today().normalize() if today is None else pd.Timestamp(today)
+    end_ts = min(pd.Timestamp(end), today)
+    return (
+        cached_index.min() <= pd.Timestamp(start) + tolerance
+        and cached_index.max() >= end_ts - tolerance
+    )
+
+
 def download_adj_close(
     tickers: List[str],
     start: str,
@@ -83,9 +113,17 @@ def download_adj_close(
         cached = cached.sort_index()
         requested = {str(t) for t in tickers}
         has_all_tickers = requested.issubset(set(cached.columns))
-        if has_all_tickers:
+        covers_dates = cache_covers_dates(cached.index, start, end)
+        if has_all_tickers and covers_dates:
             print("Loading from cache file...")
-            return cached.loc[pd.Timestamp(start):pd.Timestamp(end), sorted(requested)]
+            # Match yfinance's convention: start inclusive, end exclusive.
+            in_range = (cached.index >= pd.Timestamp(start)) & (cached.index < pd.Timestamp(end))
+            return cached.loc[in_range, sorted(requested)]
+        if has_all_tickers and not covers_dates:
+            print(
+                f"Cache date range {cached.index.min().date()}..{cached.index.max().date()} "
+                f"does not cover requested {start}..{end}; re-downloading."
+            )
 
     data = yf.download(
         tickers=tickers,
