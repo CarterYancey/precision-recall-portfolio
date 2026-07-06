@@ -254,15 +254,12 @@ def simulate_custom_portfolio_distribution(
     """
     if rng is None:
         rng = np.random.default_rng()
-    benchmark_return = 0.1
     labels = np.where(year_returns > benchmark_return, positive_label, "FALSE")
     df = pd.DataFrame({"ticker": year_returns.index.astype(str), "label": labels})
-    achieved_recall = recall
-    achieved_precision = precision
-    returns = []
-    for i in range(num_simulations):
+
+    def draw_selection():
         random_state = int(rng.integers(0, 2**31 - 1))
-        model_selection = simulate_selection(
+        return simulate_selection(
             df,
             "ticker",
             "label",
@@ -272,21 +269,26 @@ def simulate_custom_portfolio_distribution(
             random_state=random_state,
             strict=False,
         )
-        model_return = model_selected_portfolio_return(year_returns, model_selection.selected_names)
-        achieved_recall = model_selection.achieved_recall
-        achieved_precision = model_selection.achieved_precision
-        if (recall-0.1 <= model_selection.achieved_recall <= recall+0.1) and (precision-0.1 <= model_selection.achieved_precision <= precision+0.1):
-            returns.append(model_return)
-        else:
-            #print("recall: ", recall)
-            #print("model_selection.achieved_recall: ", model_selection.achieved_recall)
-            #print("precision: ", precision)
-            #print("model_selection.achieved_precision: ", model_selection.achieved_precision)
-            returns.append(None)
-            break
-        if i+1 >= model_selection.num_ways:
-            #print(f"There are only {model_selection.num_ways} ways to pick a portfolio with recall={recall} and precision={precision}.")
-            break
+
+    # Achieved metrics depend only on the label counts (draws only vary which
+    # names are sampled), so a single probe tells us whether the requested
+    # (recall, precision) is reachable within tolerance for this year.
+    probe = draw_selection()
+    achieved_recall = probe.achieved_recall
+    achieved_precision = probe.achieved_precision
+    feasible = (
+        recall - 0.1 <= achieved_recall <= recall + 0.1
+        and precision - 0.1 <= achieved_precision <= precision + 0.1
+    )
+
+    returns = []
+    if feasible:
+        returns.append(model_selected_portfolio_return(year_returns, probe.selected_names))
+        # No point drawing more often than there are distinct selections.
+        max_draws = min(num_simulations, probe.num_ways)
+        for _ in range(1, max_draws):
+            model_selection = draw_selection()
+            returns.append(model_selected_portfolio_return(year_returns, model_selection.selected_names))
 
     returns_arr = np.array(returns, dtype=float)
     returns_arr = returns_arr[~np.isnan(returns_arr)]
