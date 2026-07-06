@@ -673,6 +673,8 @@ if __name__ == "__main__":
 
     print("\n=== Sample yearly output (last 5 years) ===")
     print(res.yearly.tail(5).round(4))
+    res.summary.to_csv('res_summary.csv', index=False)
+    res.yearly.to_csv('res_yearly.csv', index=False)
 
     plot_results(res, n_values)
     plot_investment_growth(res, n_values, initial_investment=100.0)
