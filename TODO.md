@@ -28,7 +28,7 @@
 
 - [ ] Add a test suite (start with `simulate_model.py` — it's pure and fast: feasibility edge cases, rounding scheme, `estimate_num_ways` counts).
 - [ ] Add a CLI (argparse) to `pickn.py` instead of editing the `__main__` block to change `n_values`/years/recall/precision.
-- [ ] Commit a `uv.lock` for reproducible environments.
+- [x] Commit a `uv.lock` for reproducible environments.
 - [ ] Fill in the `description` field in `pyproject.toml` (currently "Add your description here").
 - [ ] Add a LICENSE file.
 - [ ] Remove commented-out debug prints in `simulate_custom_portfolio_distribution` and the commented bottom-N plotting block in `plot_results` once decisions are final.
