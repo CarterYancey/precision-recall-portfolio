@@ -2,6 +2,11 @@
 import numpy as np
 import pandas as pd
 
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 from pickn import simulate_custom_portfolio_distribution
 
 rng_returns = np.random.default_rng(42)
