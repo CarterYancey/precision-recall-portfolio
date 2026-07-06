@@ -2,7 +2,7 @@
 
 ## Correctness bugs
 
-- [x] **`simulate_custom_portfolio_distribution` ignores its `benchmark_return` argument** (`pickn.py`): the line `benchmark_return = 0.1` overwrote the actual SPY return for the year. Fixed: the hardcode is removed and labels are computed against the passed-in benchmark return.
+- [x] **`simulate_custom_portfolio_distribution` ignores its `benchmark_return` argument** (`pickn.py`): the line `benchmark_return = 0.1` overwrote the actual SPY return for the year. Fixed: the labeling target is now an explicit `label_threshold` parameter (threaded through `run_top_n_study` and `sweep_recall_precision_pairs`) — set it to a fixed value like `0.1` to simulate a classifier targeting ">10% return", or leave it `None` to target that year's benchmark return. Portfolio performance is always compared against the actual benchmark.
 - [x] **Early `break` skews the simulated distribution** (`simulate_custom_portfolio_distribution`): the loop appended `None` and `break`ed when achieved metrics fell outside the ±0.1 tolerance. Fixed: a single probe draw now validates feasibility before the loop (achieved metrics are deterministic given the label counts), and the loop runs `min(num_simulations, num_ways)` clean draws.
 - [ ] **`summary` rows embed whole Series**: `run_top_n_study` puts `custom_stats["achieved_recall"]`/`["achieved_precision"]` (per-year Series) into scalar summary cells, which is why `Precision_Recall_Tradeoff.csv` contains stringified sets like `"{0.13, 0.14, ...}"`. Store per-year values in `custom_stats` and aggregate them (e.g. mean/min/max) for the summary instead.
 - [ ] **`bottom_n_portfolio_return` docstring** says "top-n" — copy-paste error.

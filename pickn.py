@@ -245,16 +245,24 @@ def simulate_custom_portfolio_distribution(
     precision: float,
     num_simulations: int,
     *,
+    label_threshold: Optional[float] = None,
     positive_label: str = "TRUE",
     rng: Optional[np.random.Generator] = None,
 ) -> Dict[str, float]:
     """
     Run repeated simulate_selection calls for a given year and return distribution stats
     for the model-selected portfolio returns.
+
+    The hypothetical classifier labels a stock "positive" when its return exceeds
+    `label_threshold` if given (a fixed absolute target, e.g. 0.1 for "picks stocks
+    that return >10%"), otherwise that year's `benchmark_return`. Performance of the
+    resulting portfolios is always measured against the actual benchmark downstream;
+    only the classification target changes.
     """
     if rng is None:
         rng = np.random.default_rng()
-    labels = np.where(year_returns > benchmark_return, positive_label, "FALSE")
+    threshold = benchmark_return if label_threshold is None else label_threshold
+    labels = np.where(year_returns > threshold, positive_label, "FALSE")
     df = pd.DataFrame({"ticker": year_returns.index.astype(str), "label": labels})
 
     def draw_selection():
@@ -334,9 +342,15 @@ def run_top_n_study(
     model_precision: float = 0.7,
     num_simulations: int = 1000,
     model_random_seed: Optional[int] = None,
+    label_threshold: Optional[float] = None,
 ) -> StudyResult:
     """
     Main pipeline.
+
+    `label_threshold` sets the return the hypothetical classifier tries to identify
+    stocks as exceeding: a fixed absolute value (e.g. 0.1 for ">10% per year"), or
+    None to target beating that year's benchmark return. Portfolio performance is
+    always compared against the actual benchmark either way.
     """
     n_values = sorted(set(int(n) for n in n_values))
     print("model_recall: ", model_recall)
@@ -415,6 +429,7 @@ def run_top_n_study(
             model_recall,
             model_precision,
             num_simulations,
+            label_threshold=label_threshold,
             rng=rng,
         )
         for key, value in stats.items():
@@ -493,10 +508,13 @@ def sweep_recall_precision_pairs(
     tickers_by_year: Optional[Dict[int, List[str]]] = None,
     num_simulations: int = 5000,
     model_random_seed: Optional[int] = None,
+    label_threshold: Optional[float] = None,
 ) -> pd.DataFrame:
     """
     Evaluate a grid of (recall, precision) pairs and report where custom q05 CAGR
     meets or exceeds the benchmark CAGR.
+
+    See run_top_n_study for the meaning of `label_threshold`.
     """
     rows = []
     for recall in recall_values:
@@ -512,6 +530,7 @@ def sweep_recall_precision_pairs(
                 model_precision=precision,
                 num_simulations=num_simulations,
                 model_random_seed=model_random_seed,
+                label_threshold=label_threshold,
             )
             summary = study.summary
             if summary.empty:
