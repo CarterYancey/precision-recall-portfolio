@@ -12,7 +12,8 @@
 
 - [ ] **Cache validation in `download_adj_close`** checks tickers only, not the date range; a cache built for 2012–2024 silently truncates a 2000–2024 request. Validate date coverage (and consider a per-ticker incremental update rather than full re-download when one ticker is missing).
 - [ ] **Intra-year membership changes are ignored**: `get_sp500_tickers_by_year` uses only the first snapshot of each year. Consider using membership as of each year's first trading day, or handling additions/removals mid-year.
-- [ ] **Missing-data handling**: delisted tickers with no yfinance history are silently dropped, which re-introduces survivorship bias into the "point-in-time" study. At minimum, log how many tickers per year had no data; ideally source delisted-stock prices elsewhere.
+- [x] **Missing-data handling**: delisted tickers with no yfinance history were silently dropped, re-introducing survivorship bias into the "point-in-time" study. Partially fixed via `year_universe_returns`: mid-year delistings are now kept (return measured to last available price), tickers whose data starts mid-year are excluded (reused-symbol guard), and a per-year coverage report (`StudyResult.coverage`, also printed) counts the no-data drops so the residual bias is visible. Remaining work tracked below.
+- [ ] **Source delisted-stock prices from a survivorship-bias-free provider** (CRSP, Sharadar/Nasdaq Data Link, Norgate, EODHD). A 2012-universe spot check found ~80% of since-departed constituents have no data on Yahoo for their constituent years, so early-year universes are missing roughly a third of members — disproportionately the worst outcomes. No yfinance-side change can fix this.
 - [ ] `datetime.utcnow()` in `constituents.py` is deprecated since Python 3.12 — use `datetime.now(timezone.utc)`.
 - [ ] `constituents.py` and `pickn.py` are disconnected: `pickn.py` reads the committed CSV while `constituents.py` writes its own cache format (`year,ticker` rows). Either wire `get_sp500_tickers_by_year` to accept the constituents cache, or document `constituents.py` as a data-regeneration tool.
 
@@ -26,7 +27,7 @@
 
 ## Engineering hygiene
 
-- [ ] Add a test suite (start with `simulate_model.py` — it's pure and fast: feasibility edge cases, rounding scheme, `estimate_num_ways` counts).
+- [ ] Add a test suite (start with `simulate_model.py` — it's pure and fast: feasibility edge cases, rounding scheme, `estimate_num_ways` counts). *(Started: `tests/test_year_universe_returns.py` covers the survivorship-handling return computation with plain asserts.)*
 - [ ] Add a CLI (argparse) to `pickn.py` instead of editing the `__main__` block to change `n_values`/years/recall/precision.
 - [x] Commit a `uv.lock` for reproducible environments.
 - [ ] Fill in the `description` field in `pyproject.toml` (currently "Add your description here").

@@ -46,7 +46,7 @@ As configured in the `__main__` block, the script:
 - Uses year-specific S&P 500 membership from `SP500_HistoricalComponents_withChanges.csv` (first membership snapshot of each year) to reduce survivorship bias.
 - Studies years **2012–2024** with `n_values = [100, 250]` against the SPY benchmark.
 - Runs repeated model simulations (default: recall 0.2, precision 0.7, up to 1000 draws per year) to summarize the simulated portfolio's return distribution (mean, std, 5–95% band).
-- Prints an N-level summary table and recent yearly metrics to stdout.
+- Prints a per-year universe coverage / survivorship report (constituents with no price data, mid-year delistings kept at last price, mid-year data starts excluded), an N-level summary table, and recent yearly metrics to stdout.
 - Saves two plots: `topNAndCustom_vs_spy.png` (yearly returns with the simulated-model band) and `topNAndCustom_growth.png` (value of $100 reinvested annually).
 
 To customize, edit the `__main__` block or call `run_top_n_study` yourself — key parameters are `n_values`, `year_start`/`year_end`, `model_recall`/`model_precision`, and `num_simulations`. You can supply `tickers_by_year` to override per-year membership, or a fixed `tickers` list to use a static universe.
@@ -90,9 +90,12 @@ This downloads adjusted-close prices for that year's constituents, computes cale
 
 ## Notes and caveats
 
-- yfinance is the price source; results depend on data availability and may vary slightly over time. Delisted/renamed tickers from the historical membership file often have no data and are silently dropped from that year's universe.
+- **Survivorship bias is the biggest caveat, and it is only partially fixable with yfinance.** The point-in-time membership file fixes *universe* selection, but Yahoo has no price history for most delisted names (a spot check of the 2012 constituents that have since left the index found ~80% with no 2012 data — including exactly the bankruptcies and blowups a study most needs). What the code does about it:
+  - Tickers that stop trading **mid-year** are kept, with their return measured to the last available price (previously they became NaN and were silently dropped) — see `year_universe_returns`.
+  - Tickers whose data only **begins** mid-year are excluded, since a constituent that "starts trading" mid-year usually means the symbol was later reused by a different company.
+  - Tickers with **no data at all** cannot be recovered; `run_top_n_study` prints a per-year coverage report and returns it as `StudyResult.coverage` so the residual bias is at least measured, not hidden. Absolute return levels (especially top-N and early years) should be read as **upper bounds**. A survivorship-bias-free source (CRSP, Sharadar, Norgate, EODHD) is the only complete fix.
 - "Top-N" portfolios are formed **ex post** (with hindsight) — they are an upper bound, not a strategy.
-- The simulated-model labels in `simulate_custom_portfolio_distribution` currently use a hardcoded 10% return threshold rather than the actual SPY return for the year (see `TODO.md`).
+- The hypothetical classifier's labeling target is controlled by `label_threshold` (`None` = beat that year's benchmark; a fixed value like `0.1` = ">10% return").
 - This is research code, not investment advice.
 
 ## Future work

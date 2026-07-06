@@ -5,8 +5,18 @@ Notes / assumptions:
 - "Top-performing stocks for that year" is determined ex post (with hindsight).
 - Uses point-in-time historical S&P 500 membership by default
   (SP500_HistoricalComponents_withChanges.csv, first snapshot of each year).
-  Note delisted tickers without price history are still dropped, so some
-  survivorship bias remains.
+- Survivorship bias handling (see year_universe_returns):
+  * Tickers that stop trading mid-year (delistings/bankruptcies) are kept,
+    with the return measured to their last available price, instead of being
+    silently dropped for lacking a year-end price.
+  * Tickers whose data only begins mid-year are excluded (guards against
+    reused ticker symbols mapping to a different, later company).
+  * Tickers with no price data at all cannot be recovered from yfinance and
+    are dropped; per-year counts are reported in StudyResult.coverage so the
+    residual bias is visible. Because Yahoo lacks history for most delisted
+    names (e.g. Enron, Bear Stearns), dropped names skew toward the worst
+    outcomes and results remain upward-biased. A survivorship-bias-free
+    price source (CRSP, Sharadar, Norgate, ...) is the only full fix.
 - Uses adjusted close (includes splits + dividends where provider supports it).
 - S&P 500 benchmark is proxied by SPY total return via adjusted close.
 """
@@ -138,6 +148,74 @@ def compute_calendar_year_returns(adj: pd.DataFrame, years: Iterable[int]) -> pd
     return out
 
 
+def year_universe_returns(
+    adj: pd.DataFrame,
+    year: int,
+    tickers: List[str],
+    *,
+    max_start_lag: int = 10,
+    max_end_lead: int = 10,
+) -> Tuple[pd.Series, Dict[str, float]]:
+    """
+    Calendar-year returns for a point-in-time universe, without silently
+    dropping mid-year delistings.
+
+    For each ticker the return uses the first and last *available* prices
+    within the year, so a stock that stops trading in June (bankruptcy,
+    acquisition) stays in the universe with its return measured to its final
+    print instead of becoming NaN. Rules:
+
+    - No price data in the year at all -> dropped, counted as ``no_data``.
+      (This is the residual survivorship bias yfinance forces on us.)
+    - First price more than `max_start_lag` trading days after the year's
+      first trading day -> excluded, counted as ``late_start``. The ticker
+      was a constituent at the year start, so data appearing only mid-year
+      usually means the symbol was reused by a different company later.
+    - Last price more than `max_end_lead` trading days before the year's
+      last trading day -> kept, counted as ``partial_year`` (delisted
+      mid-year, return measured to the last available price).
+    - Otherwise counted as ``full_year``.
+
+    Returns (returns indexed by ticker, coverage stats dict).
+    """
+    mask = adj.index.year == year
+    stats = {
+        "members": len(tickers),
+        "no_data": 0,
+        "late_start": 0,
+        "partial_year": 0,
+        "full_year": 0,
+    }
+    if not mask.any():
+        stats["used"] = 0
+        stats["coverage"] = np.nan
+        return pd.Series(dtype=float), stats
+
+    window = adj.loc[mask]
+    days = window.index
+    start_cutoff = days[min(max_start_lag, len(days) - 1)]
+    end_cutoff = days[max(len(days) - 1 - max_end_lead, 0)]
+
+    returns = {}
+    for t in tickers:
+        col = window[t].dropna() if t in window.columns else pd.Series(dtype=float)
+        if len(col) < 2:
+            stats["no_data"] += 1
+            continue
+        if col.index[0] > start_cutoff:
+            stats["late_start"] += 1
+            continue
+        if col.index[-1] < end_cutoff:
+            stats["partial_year"] += 1
+        else:
+            stats["full_year"] += 1
+        returns[t] = float(col.iloc[-1] / col.iloc[0] - 1.0)
+
+    stats["used"] = stats["partial_year"] + stats["full_year"]
+    stats["coverage"] = stats["used"] / stats["members"] if stats["members"] else np.nan
+    return pd.Series(returns, dtype=float), stats
+
+
 def simulate_year_model_selection(
     year: int,
     recall: float,
@@ -170,18 +248,24 @@ def simulate_year_model_selection(
     start = f"{year}-01-01"
     end = f"{year + 1}-01-01"
     adj = download_adj_close(tickers_all, start, end, cache_path=cache_path)
-    year_returns = compute_calendar_year_returns(adj, [year])
-    if year_returns.empty or year not in year_returns.index:
+    bmk_returns = compute_calendar_year_returns(adj[[benchmark]], [year])
+    if bmk_returns.empty or year not in bmk_returns.index:
         raise ValueError(f"Could not compute returns for year {year}.")
-
-    year_series = year_returns.loc[year]
-    spy_return = year_series.get(benchmark)
+    spy_return = bmk_returns.loc[year, benchmark]
     if pd.isna(spy_return):
         raise ValueError(f"Missing benchmark return for {benchmark} in year {year}.")
 
-    stock_returns = year_series.drop(labels=[benchmark], errors="ignore").dropna()
+    stock_universe = [t for t in tickers_for_year if t != benchmark]
+    stock_returns, cov = year_universe_returns(adj, year, stock_universe)
     if stock_returns.empty:
         raise ValueError(f"No stock returns available for year {year}.")
+    if cov["no_data"] or cov["late_start"]:
+        print(
+            f"[{year}] universe coverage {cov['coverage']:.1%}: "
+            f"{cov['no_data']} constituents had no price data (survivorship bias), "
+            f"{cov['late_start']} excluded for data starting mid-year, "
+            f"{cov['partial_year']} delisted mid-year kept at last price."
+        )
 
     labels = np.where(stock_returns > spy_return, positive_label, "FALSE")
     df = pd.DataFrame(
@@ -331,6 +415,7 @@ class StudyResult:
     by_n_bottom: pd.DataFrame            # year x N (portfolio returns)
     custom_stats: pd.DataFrame    # year x custom distribution stats
     summary: pd.DataFrame         # N-level summary stats
+    coverage: pd.DataFrame        # year x universe coverage / survivorship stats
 
 
 def run_top_n_study(
@@ -387,22 +472,28 @@ def run_top_n_study(
     years = range(year_start, year_end + 1)
 
     stock_yearly_rows = {}
+    coverage_rows = {}
     for y in years:
         tickers_for_year = tickers_by_year.get(y)
         if not tickers_for_year:
             continue
-        endpoints = year_endpoints(adj_stk.index, y)
-        if endpoints is None:
+        year_rets, cov = year_universe_returns(adj_stk, y, tickers_for_year)
+        if year_rets.empty:
             continue
-        d0, d1 = endpoints
-        available = [t for t in tickers_for_year if t in adj_stk.columns]
-        if not available:
-            continue
-        p0 = adj_stk.loc[d0, available]
-        p1 = adj_stk.loc[d1, available]
-        stock_yearly_rows[y] = (p1 / p0) - 1.0
+        stock_yearly_rows[y] = year_rets
+        coverage_rows[y] = cov
     stock_yearly = pd.DataFrame(stock_yearly_rows).T
     stock_yearly.index.name = "year"
+    coverage = pd.DataFrame(coverage_rows).T
+    coverage.index.name = "year"
+    print("\n=== Universe coverage / survivorship report ===")
+    print(coverage.to_string(float_format=lambda v: f"{v:.3f}"))
+    print(
+        "no_data tickers were index members but have no yfinance history "
+        "(mostly delistings) and are excluded — results are upward-biased "
+        "in proportion to these counts. partial_year tickers stopped trading "
+        "mid-year and are included at their last available price."
+    )
     bmk_yearly = compute_calendar_year_returns(adj_bmk, years)[benchmark]
 
     # Compute top-N returns per year
@@ -505,6 +596,7 @@ def run_top_n_study(
         by_n_bottom=by_n_bottom,
         custom_stats=custom_stats,
         summary=summary,
+        coverage=coverage,
     )
 
 
