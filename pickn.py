@@ -3,8 +3,10 @@ Top-N winners vs S&P 500 (1-year horizons, by calendar year)
 
 Notes / assumptions:
 - "Top-performing stocks for that year" is determined ex post (with hindsight).
-- Uses *current* S&P 500 constituents from Wikipedia by default -> survivorship bias.
-  For a cleaner historical study, replace the constituent source with a point-in-time dataset.
+- Uses point-in-time historical S&P 500 membership by default
+  (SP500_HistoricalComponents_withChanges.csv, first snapshot of each year).
+  Note delisted tickers without price history are still dropped, so some
+  survivorship bias remains.
 - Uses adjusted close (includes splits + dividends where provider supports it).
 - S&P 500 benchmark is proxied by SPY total return via adjusted close.
 """
@@ -214,7 +216,7 @@ def top_n_portfolio_return(year_returns: pd.Series, n: int) -> float:
 
 def bottom_n_portfolio_return(year_returns: pd.Series, n: int) -> float:
     """
-    Equal-weight return of top-n stocks for that year (ignores missing).
+    Equal-weight return of bottom-n stocks for that year (ignores missing).
     """
     yr = year_returns.dropna()
     if yr.empty:
@@ -416,7 +418,11 @@ def run_top_n_study(
         for n in n_values:
             by_n_bottom.loc[y, n] = bottom_n_portfolio_return(row, n)
     # Compute custom-N returns per year
-    custom_stats = pd.DataFrame(index=stock_yearly.index, columns=["mean", "std", "q05", "q95", "count"], dtype=float)
+    custom_stats = pd.DataFrame(
+        index=stock_yearly.index,
+        columns=["mean", "std", "q05", "q95", "count", "achieved_recall", "achieved_precision"],
+        dtype=float,
+    )
     rng = np.random.default_rng(model_random_seed)
     for y in stock_yearly.index:
         row = stock_yearly.loc[y]
@@ -457,6 +463,8 @@ def run_top_n_study(
     custom_mean_cagr = compute_cagr(custom_stats["mean"]) if "mean" in custom_stats.columns else np.nan
     custom_q05_cagr = compute_cagr(custom_stats["q05"]) if "mean" in custom_stats.columns else np.nan
     custom_q95_cagr = compute_cagr(custom_stats["q95"]) if "mean" in custom_stats.columns else np.nan
+    achieved_recall = custom_stats["achieved_recall"]
+    achieved_precision = custom_stats["achieved_precision"]
     for n in n_values:
         r = by_n[n]
         r2 = by_n_bottom[n]
@@ -474,8 +482,12 @@ def run_top_n_study(
             "cagr_custom_mean": custom_mean_cagr,
             "cagr_custom_q05": custom_q05_cagr,
             "cagr_custom_q95": custom_q95_cagr,
-            "custom_recall": custom_stats["achieved_recall"],
-            "custom_precision": custom_stats["achieved_precision"],
+            "custom_recall_mean": float(achieved_recall.mean()),
+            "custom_recall_min": float(achieved_recall.min()),
+            "custom_recall_max": float(achieved_recall.max()),
+            "custom_precision_mean": float(achieved_precision.mean()),
+            "custom_precision_min": float(achieved_precision.min()),
+            "custom_precision_max": float(achieved_precision.max()),
         })
     summary = pd.DataFrame(summary_rows).set_index("N")
 
@@ -538,6 +550,8 @@ def sweep_recall_precision_pairs(
                     {
                         "recall": recall,
                         "precision": precision,
+                        "achieved_recall_mean": np.nan,
+                        "achieved_precision_mean": np.nan,
                         "cagr_custom_q05": np.nan,
                         "cagr_benchmark": np.nan,
                         "custom_q05_meets_benchmark": False,
@@ -548,8 +562,10 @@ def sweep_recall_precision_pairs(
             cagr_benchmark = float(summary["cagr_benchmark"].iloc[0])
             rows.append(
                 {
-                    "recall": set(summary["custom_recall"].iloc[0].round(2)),
-                    "precision": set(summary["custom_precision"].iloc[0].round(2)),
+                    "recall": recall,
+                    "precision": precision,
+                    "achieved_recall_mean": float(summary["custom_recall_mean"].iloc[0]),
+                    "achieved_precision_mean": float(summary["custom_precision_mean"].iloc[0]),
                     "cagr_custom_q05": cagr_custom_q05,
                     "cagr_benchmark": cagr_benchmark,
                     "custom_q05_meets_benchmark": cagr_custom_q05 >= cagr_benchmark,
