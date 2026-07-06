@@ -135,7 +135,7 @@ def main() -> None:
     parser.add_argument(
         "--year-end",
         type=int,
-        default=datetime.utcnow().year,
+        default=datetime.now(timezone.utc).year
         help="Last year (inclusive) to fetch membership for (default: current year).",
     )
     parser.add_argument(
