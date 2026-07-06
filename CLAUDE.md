@@ -22,7 +22,7 @@
 - The "positive" class label is the string `"TRUE"` (not a boolean) — see `positive_label` parameters.
 - `get_sp500_tickers_by_year` takes only the **first** membership snapshot of each calendar year; intra-year index changes are ignored.
 - The cache check in `download_adj_close` verifies ticker coverage but **not** date coverage; a stale cache with a shorter date range is silently sliced. Delete `adj_close_cache.csv` when changing the study period.
-- `simulate_custom_portfolio_distribution` currently **hardcodes `benchmark_return = 0.1`**, ignoring the SPY return passed in. This is a known issue (see `TODO.md`) — don't "helpfully" rely on the parameter being used until it's fixed.
+- The hypothetical classifier's labeling target in `simulate_custom_portfolio_distribution` is controlled by `label_threshold` (threaded through `run_top_n_study` and `sweep_recall_precision_pairs`): `None` labels stocks against that year's benchmark return; a fixed value (e.g. `0.1`) simulates a model that picks stocks returning more than that absolute threshold. Performance is always *compared* against the actual benchmark — only the classification target changes.
 - Plots are written to the repo root as `topNAndCustom_vs_spy.png` and `topNAndCustom_growth.png`; PNGs and the price cache are gitignored.
 - There is no test suite yet. A full `pickn.py` run needs network access to yfinance and can take a long time uncached; prefer testing `simulate_model.py` functions (pure, fast) when validating changes.
 

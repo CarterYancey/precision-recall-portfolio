@@ -245,24 +245,29 @@ def simulate_custom_portfolio_distribution(
     precision: float,
     num_simulations: int,
     *,
+    label_threshold: Optional[float] = None,
     positive_label: str = "TRUE",
     rng: Optional[np.random.Generator] = None,
 ) -> Dict[str, float]:
     """
     Run repeated simulate_selection calls for a given year and return distribution stats
     for the model-selected portfolio returns.
+
+    The hypothetical classifier labels a stock "positive" when its return exceeds
+    `label_threshold` if given (a fixed absolute target, e.g. 0.1 for "picks stocks
+    that return >10%"), otherwise that year's `benchmark_return`. Performance of the
+    resulting portfolios is always measured against the actual benchmark downstream;
+    only the classification target changes.
     """
     if rng is None:
         rng = np.random.default_rng()
-    benchmark_return = 0.1
-    labels = np.where(year_returns > benchmark_return, positive_label, "FALSE")
+    threshold = benchmark_return if label_threshold is None else label_threshold
+    labels = np.where(year_returns > threshold, positive_label, "FALSE")
     df = pd.DataFrame({"ticker": year_returns.index.astype(str), "label": labels})
-    achieved_recall = recall
-    achieved_precision = precision
-    returns = []
-    for i in range(num_simulations):
+
+    def draw_selection():
         random_state = int(rng.integers(0, 2**31 - 1))
-        model_selection = simulate_selection(
+        return simulate_selection(
             df,
             "ticker",
             "label",
@@ -272,21 +277,26 @@ def simulate_custom_portfolio_distribution(
             random_state=random_state,
             strict=False,
         )
-        model_return = model_selected_portfolio_return(year_returns, model_selection.selected_names)
-        achieved_recall = model_selection.achieved_recall
-        achieved_precision = model_selection.achieved_precision
-        if (recall-0.1 <= model_selection.achieved_recall <= recall+0.1) and (precision-0.1 <= model_selection.achieved_precision <= precision+0.1):
-            returns.append(model_return)
-        else:
-            #print("recall: ", recall)
-            #print("model_selection.achieved_recall: ", model_selection.achieved_recall)
-            #print("precision: ", precision)
-            #print("model_selection.achieved_precision: ", model_selection.achieved_precision)
-            returns.append(None)
-            break
-        if i+1 >= model_selection.num_ways:
-            #print(f"There are only {model_selection.num_ways} ways to pick a portfolio with recall={recall} and precision={precision}.")
-            break
+
+    # Achieved metrics depend only on the label counts (draws only vary which
+    # names are sampled), so a single probe tells us whether the requested
+    # (recall, precision) is reachable within tolerance for this year.
+    probe = draw_selection()
+    achieved_recall = probe.achieved_recall
+    achieved_precision = probe.achieved_precision
+    feasible = (
+        recall - 0.1 <= achieved_recall <= recall + 0.1
+        and precision - 0.1 <= achieved_precision <= precision + 0.1
+    )
+
+    returns = []
+    if feasible:
+        returns.append(model_selected_portfolio_return(year_returns, probe.selected_names))
+        # No point drawing more often than there are distinct selections.
+        max_draws = min(num_simulations, probe.num_ways)
+        for _ in range(1, max_draws):
+            model_selection = draw_selection()
+            returns.append(model_selected_portfolio_return(year_returns, model_selection.selected_names))
 
     returns_arr = np.array(returns, dtype=float)
     returns_arr = returns_arr[~np.isnan(returns_arr)]
@@ -332,9 +342,15 @@ def run_top_n_study(
     model_precision: float = 0.7,
     num_simulations: int = 1000,
     model_random_seed: Optional[int] = None,
+    label_threshold: Optional[float] = None,
 ) -> StudyResult:
     """
     Main pipeline.
+
+    `label_threshold` sets the return the hypothetical classifier tries to identify
+    stocks as exceeding: a fixed absolute value (e.g. 0.1 for ">10% per year"), or
+    None to target beating that year's benchmark return. Portfolio performance is
+    always compared against the actual benchmark either way.
     """
     n_values = sorted(set(int(n) for n in n_values))
     print("model_recall: ", model_recall)
@@ -413,6 +429,7 @@ def run_top_n_study(
             model_recall,
             model_precision,
             num_simulations,
+            label_threshold=label_threshold,
             rng=rng,
         )
         for key, value in stats.items():
@@ -491,10 +508,13 @@ def sweep_recall_precision_pairs(
     tickers_by_year: Optional[Dict[int, List[str]]] = None,
     num_simulations: int = 5000,
     model_random_seed: Optional[int] = None,
+    label_threshold: Optional[float] = None,
 ) -> pd.DataFrame:
     """
     Evaluate a grid of (recall, precision) pairs and report where custom q05 CAGR
     meets or exceeds the benchmark CAGR.
+
+    See run_top_n_study for the meaning of `label_threshold`.
     """
     rows = []
     for recall in recall_values:
@@ -510,6 +530,7 @@ def sweep_recall_precision_pairs(
                 model_precision=precision,
                 num_simulations=num_simulations,
                 model_random_seed=model_random_seed,
+                label_threshold=label_threshold,
             )
             summary = study.summary
             if summary.empty:
@@ -652,6 +673,8 @@ if __name__ == "__main__":
 
     print("\n=== Sample yearly output (last 5 years) ===")
     print(res.yearly.tail(5).round(4))
+    res.summary.to_csv('res_summary.csv', index=False)
+    res.yearly.to_csv('res_yearly.csv', index=False)
 
     plot_results(res, n_values)
     plot_investment_growth(res, n_values, initial_investment=100.0)
