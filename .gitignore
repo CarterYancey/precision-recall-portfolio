@@ -1,5 +1,7 @@
 adj_close_cache.csv
 sp500_constituents_wikipedia_by_year.csv
+res_summary.csv
+res_yearly.csv
 *.png
 .venv/
 __pycache__/

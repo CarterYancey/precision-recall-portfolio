@@ -23,7 +23,9 @@ Notes / assumptions:
 
 from __future__ import annotations
 
+import argparse
 import math
+import sys
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Iterable, List, Dict, Tuple, Optional
@@ -651,12 +653,14 @@ def sweep_recall_precision_pairs(
     num_simulations: int = 5000,
     model_random_seed: Optional[int] = None,
     label_threshold: Optional[float] = None,
+    output_csv: Optional[str] = "Precision_Recall_Tradeoff.csv",
 ) -> pd.DataFrame:
     """
     Evaluate a grid of (recall, precision) pairs and report where custom q05 CAGR
     meets or exceeds the benchmark CAGR.
 
-    See run_top_n_study for the meaning of `label_threshold`.
+    See run_top_n_study for the meaning of `label_threshold`. Pass
+    `output_csv=None` to skip writing the results to disk.
     """
     rows = []
     for recall in recall_values:
@@ -705,7 +709,8 @@ def sweep_recall_precision_pairs(
     pd.set_option("display.max_columns", 50)
     df = pd.DataFrame(rows).round(4)
     print(df)
-    df.to_csv('Precision_Recall_Tradeoff.csv')
+    if output_csv:
+        df.to_csv(output_csv)
     return df
 
 def plot_results(res: StudyResult, n_values):
@@ -802,13 +807,103 @@ def plot_investment_growth(res: StudyResult, n_values, initial_investment: float
     plt.savefig("topNAndCustom_growth.png", dpi=150, bbox_inches="tight")
     plt.close()
 
-if __name__ == "__main__":
-    n_values=[100, 250]
+def build_parser() -> argparse.ArgumentParser:
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument(
+        "--n-values", type=int, nargs="+", default=[100, 250], metavar="N",
+        help="Top-N portfolio sizes to evaluate (default: %(default)s).",
+    )
+    common.add_argument(
+        "--year-start", type=int, default=2012,
+        help="First calendar year of the study (default: %(default)s).",
+    )
+    common.add_argument(
+        "--year-end", type=int, default=2024,
+        help="Last calendar year of the study, inclusive (default: %(default)s).",
+    )
+    common.add_argument(
+        "--benchmark", default="SPY",
+        help="Benchmark ticker (default: %(default)s).",
+    )
+    common.add_argument(
+        "--seed", type=int, default=None,
+        help="Random seed for the simulated classifier (default: nondeterministic).",
+    )
+    common.add_argument(
+        "--label-threshold", type=float, default=None,
+        help="Absolute return the hypothetical classifier labels stocks against "
+             "(e.g. 0.1 for '>10%% per year'). Omit to label against each year's "
+             "benchmark return. Performance is always compared to the benchmark.",
+    )
+
+    parser = argparse.ArgumentParser(
+        prog="pickn",
+        description="Top-N winners vs S&P 500 study and (recall, precision) sweep. "
+                    "Running with no subcommand is equivalent to 'study' with defaults.",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    study = sub.add_parser(
+        "study", parents=[common],
+        help="Run the top-N study once for a single (recall, precision) pair and write plots.",
+    )
+    study.add_argument(
+        "--recall", type=float, default=0.2,
+        help="Target recall of the simulated classifier (default: %(default)s).",
+    )
+    study.add_argument(
+        "--precision", type=float, default=0.7,
+        help="Target precision of the simulated classifier (default: %(default)s).",
+    )
+    study.add_argument(
+        "--num-simulations", type=int, default=1000,
+        help="Random portfolio draws per year (default: %(default)s).",
+    )
+    study.add_argument(
+        "--initial-investment", type=float, default=100.0,
+        help="Starting value for the growth plot (default: %(default)s).",
+    )
+    study.add_argument(
+        "--no-plots", action="store_true",
+        help="Skip writing the PNG plots.",
+    )
+
+    sweep = sub.add_parser(
+        "sweep", parents=[common],
+        help="Run the study over a grid of (recall, precision) pairs and report "
+             "where custom q05 CAGR meets the benchmark.",
+    )
+    sweep.add_argument(
+        "--recalls", type=float, nargs="+", default=[0.1, 0.2, 0.3],
+        metavar="R", help="Recall grid values (default: %(default)s).",
+    )
+    sweep.add_argument(
+        "--precisions", type=float, nargs="+", default=[0.5, 0.6, 0.7, 0.8],
+        metavar="P", help="Precision grid values (default: %(default)s).",
+    )
+    sweep.add_argument(
+        "--num-simulations", type=int, default=5000,
+        help="Random portfolio draws per year per pair (default: %(default)s).",
+    )
+    sweep.add_argument(
+        "--output", default="Precision_Recall_Tradeoff.csv",
+        help="CSV path for the sweep results (default: %(default)s).",
+    )
+
+    return parser
+
+
+def run_study_command(args: argparse.Namespace) -> None:
     res = run_top_n_study(
-        n_values,
-        year_start=2012,
-        year_end=2024,
-        benchmark="SPY",
+        n_values=args.n_values,
+        year_start=args.year_start,
+        year_end=args.year_end,
+        benchmark=args.benchmark,
+        model_recall=args.recall,
+        model_precision=args.precision,
+        num_simulations=args.num_simulations,
+        model_random_seed=args.seed,
+        label_threshold=args.label_threshold,
     )
 
     pd.set_option("display.width", 140)
@@ -822,5 +917,37 @@ if __name__ == "__main__":
     res.summary.to_csv('res_summary.csv', index=False)
     res.yearly.to_csv('res_yearly.csv', index=False)
 
-    plot_results(res, n_values)
-    plot_investment_growth(res, n_values, initial_investment=100.0)
+    if not args.no_plots:
+        plot_results(res, args.n_values)
+        plot_investment_growth(res, args.n_values, initial_investment=args.initial_investment)
+
+
+def run_sweep_command(args: argparse.Namespace) -> None:
+    sweep_recall_precision_pairs(
+        recall_values=args.recalls,
+        precision_values=args.precisions,
+        n_values=args.n_values,
+        year_start=args.year_start,
+        year_end=args.year_end,
+        benchmark=args.benchmark,
+        num_simulations=args.num_simulations,
+        model_random_seed=args.seed,
+        label_threshold=args.label_threshold,
+        output_csv=args.output,
+    )
+
+
+def main(argv: Optional[List[str]] = None) -> None:
+    if argv is None:
+        argv = sys.argv[1:]
+    if not argv:
+        argv = ["study"]
+    args = build_parser().parse_args(argv)
+    if args.command == "sweep":
+        run_sweep_command(args)
+    else:
+        run_study_command(args)
+
+
+if __name__ == "__main__":
+    main()

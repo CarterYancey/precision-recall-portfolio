@@ -36,12 +36,12 @@ Without `uv`, a plain `pip install yfinance pandas numpy matplotlib lxml html5li
 ## Running the top-N study
 
 ```bash
-uv run python pickn.py
+uv run python pickn.py            # same as `uv run python pickn.py study`
 ```
 
 The first run downloads price data from yfinance for every historical constituent (thousands of tickers) — expect it to take a while and produce a large `adj_close_cache.csv`. Subsequent runs load from the cache.
 
-As configured in the `__main__` block, the script:
+With default options, the script:
 
 - Uses year-specific S&P 500 membership from `SP500_HistoricalComponents_withChanges.csv` (first membership snapshot of each year) to reduce survivorship bias.
 - Studies years **2012–2024** with `n_values = [100, 250]` against the SPY benchmark.
@@ -49,18 +49,24 @@ As configured in the `__main__` block, the script:
 - Prints a per-year universe coverage / survivorship report (constituents with no price data, mid-year delistings kept at last price, mid-year data starts excluded), an N-level summary table, and recent yearly metrics to stdout.
 - Saves two plots: `topNAndCustom_vs_spy.png` (yearly returns with the simulated-model band) and `topNAndCustom_growth.png` (value of $100 reinvested annually).
 
-To customize, edit the `__main__` block or call `run_top_n_study` yourself — key parameters are `n_values`, `year_start`/`year_end`, `model_recall`/`model_precision`, and `num_simulations`. You can supply `tickers_by_year` to override per-year membership, or a fixed `tickers` list to use a static universe.
+To customize, pass CLI flags to the `study` subcommand (see `uv run python pickn.py study --help` for the full list):
+
+```bash
+uv run python pickn.py study --n-values 10 50 100 --year-start 2000 --year-end 2024 \
+    --recall 0.3 --precision 0.8 --num-simulations 2000 --seed 42
+```
+
+Other useful flags: `--benchmark` (default SPY), `--label-threshold` (label stocks against a fixed absolute return instead of the year's benchmark), `--initial-investment` (growth-plot starting value), and `--no-plots`. For programmatic use — e.g. supplying `tickers_by_year` to override per-year membership, or a fixed `tickers` list for a static universe — call `run_top_n_study` directly.
 
 ## Sweeping recall/precision pairs
 
-`sweep_recall_precision_pairs` in `pickn.py` evaluates a grid of (recall, precision) pairs, reporting for each whether the 5th-percentile CAGR of the simulated portfolios meets or exceeds the benchmark CAGR. Results are printed and written to `Precision_Recall_Tradeoff.csv`.
+The `sweep` subcommand evaluates a grid of (recall, precision) pairs, reporting for each whether the 5th-percentile CAGR of the simulated portfolios meets or exceeds the benchmark CAGR. Results are printed and written to `Precision_Recall_Tradeoff.csv` (override with `--output`).
 
 ```bash
-uv run python -c "
-from pickn import sweep_recall_precision_pairs
-sweep_recall_precision_pairs([0.1, 0.2, 0.3], [0.5, 0.6, 0.7, 0.8, 0.9])
-"
+uv run python pickn.py sweep --recalls 0.1 0.2 0.3 --precisions 0.5 0.6 0.7 0.8 0.9
 ```
+
+The grid defaults to recalls `0.1 0.2 0.3` × precisions `0.5 0.6 0.7 0.8`, and the shared study flags (`--n-values`, `--year-start`/`--year-end`, `--benchmark`, `--seed`, `--label-threshold`, `--num-simulations`) apply here too — see `uv run python pickn.py sweep --help`.
 
 Note this re-runs the full study per grid cell, so it is slow on the first (uncached) run.
 
