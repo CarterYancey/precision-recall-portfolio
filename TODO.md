@@ -9,7 +9,7 @@
 
 ## Features / analysis (original planned enhancements)
 
-- [ ] Sweep across multiple recall and precision values to understand performance sensitivity. *(Partially done: `sweep_recall_precision_pairs` exists and its output is now clean scalars, but it redundantly re-runs the full study — including top-N computation — per grid cell.)*
+- [x] Sweep across multiple recall and precision values to understand performance sensitivity. Fixed: prices, per-year universe returns, and the benchmark CAGR are computed once (`prepare_universe_returns`) and only the classifier simulation (`compute_custom_stats`) is re-run per grid cell — no more full study (with top-N computation) per pair. The grid loop itself is `sweep_from_returns`, testable without network; covered by `tests/test_sweep.py`.
 - [ ] Compute total expected returns and their variance for the hypothetical model-driven portfolios to quantify the recall/precision needed for consistent outperformance (hypothesis: sufficiently high precision can beat the market even with low recall).
 - [ ] Consider cap-weighted (not just equal-weighted) portfolio variants.
-- [ ] Plot the recall/precision sweep as a heatmap (precision × recall → q05 CAGR vs. benchmark).
+- [x] Plot the recall/precision sweep as a heatmap (precision × recall → q05 CAGR vs. benchmark). Done: `plot_sweep_heatmap` writes `recall_precision_heatmap.png` (diverging red/gray/blue centered at zero excess; infeasible cells shown as "n/a") after every `sweep` run unless `--no-plots` is passed.
