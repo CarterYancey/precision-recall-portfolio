@@ -12,7 +12,7 @@
 
 ## Project map
 
-- `pickn.py` — main study pipeline (`run_top_n_study`), yearly-label simulation (`simulate_year_model_selection`), grid sweep (`sweep_recall_precision_pairs`), plotting, and the yfinance download/cache layer (`download_adj_close`). Entry point: `uv run python pickn.py`.
+- `pickn.py` — main study pipeline (`run_top_n_study`), yearly-label simulation (`simulate_year_model_selection`), grid sweep (`sweep_recall_precision_pairs`), plotting, and the yfinance download/cache layer (`download_adj_close`). Entry point: `uv run python pickn.py` — an argparse CLI with `study` (default when no subcommand is given) and `sweep` subcommands; see `--help` on each.
 - `simulate_model.py` — pure combinatorics/sampling, no network or market data. `simulate_selection` builds a random selection hitting a target (recall, precision); `estimate_num_ways` counts how many such selections exist. `pickn.py` imports from here; nothing imports `pickn.py`.
 - `constituents.py` — standalone CLI for fetching point-in-time S&P 500 membership from Wikipedia revision history. Not imported by the other modules; `pickn.py` reads the committed CSV instead.
 
