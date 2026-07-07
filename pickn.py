@@ -458,30 +458,21 @@ class StudyResult:
     coverage: pd.DataFrame        # year x universe coverage / survivorship stats
 
 
-def run_top_n_study(
-    n_values: Iterable[int] = (1, 5, 10, 20, 50, 100),
-    year_start: int = 2000,
-    year_end: int = 2024,
+def prepare_universe_returns(
+    year_start: int,
+    year_end: int,
     benchmark: str = "SPY",
     tickers: Optional[List[str]] = None,
     tickers_by_year: Optional[Dict[int, List[str]]] = None,
-    model_recall: float = .2,
-    model_precision: float = 0.7,
-    num_simulations: int = 1000,
-    model_random_seed: Optional[int] = None,
-    label_threshold: Optional[float] = None,
-) -> StudyResult:
+) -> Tuple[pd.DataFrame, pd.Series, pd.DataFrame]:
     """
-    Main pipeline.
+    Download prices once and compute the inputs every study/sweep run shares:
+    per-year universe returns (year x ticker), benchmark calendar-year returns,
+    and the coverage/survivorship report (also printed).
 
-    `label_threshold` sets the return the hypothetical classifier tries to identify
-    stocks as exceeding: a fixed absolute value (e.g. 0.1 for ">10% per year"), or
-    None to target beating that year's benchmark return. Portfolio performance is
-    always compared against the actual benchmark either way.
+    None of this depends on the simulated classifier's (recall, precision), so
+    a grid sweep calls it once and reuses the result for every cell.
     """
-    n_values = sorted(set(int(n) for n in n_values))
-    print("model_recall: ", model_recall)
-    print("model_precision: ", model_precision)
     if tickers_by_year is None:
         if tickers is None:
             tickers_by_year = get_sp500_tickers_by_year()
@@ -490,20 +481,16 @@ def run_top_n_study(
                 y: tickers for y in range(year_start, year_end + 1)
             }
 
-    # Download prices for constituents + benchmark
     tickers_union = {
         ticker for tickers_for_year in tickers_by_year.values()
         for ticker in tickers_for_year
     }
     all_tickers = sorted(tickers_union | {benchmark})
 
-    # Pull a bit of buffer around endpoints
     start = f"{year_start}-01-01"
     end = f"{year_end}-12-31"
-
     adj = download_adj_close(all_tickers, start=start, end=end, auto_adjust=False)
 
-    # Separate benchmark and stock universe
     if benchmark not in adj.columns:
         raise ValueError(f"Benchmark {benchmark} not in downloaded columns.")
     adj_bmk = adj[[benchmark]].copy()
@@ -535,6 +522,80 @@ def run_top_n_study(
         "mid-year and are included at their last available price."
     )
     bmk_yearly = compute_calendar_year_returns(adj_bmk, years)[benchmark]
+    return stock_yearly, bmk_yearly, coverage
+
+
+def compute_custom_stats(
+    stock_yearly: pd.DataFrame,
+    bmk_yearly: pd.Series,
+    recall: float,
+    precision: float,
+    num_simulations: int,
+    *,
+    label_threshold: Optional[float] = None,
+    rng: Optional[np.random.Generator] = None,
+) -> pd.DataFrame:
+    """
+    Per-year distribution stats for the simulated classifier's portfolios
+    (year x mean/std/q05/q95/count/achieved metrics). This is the only part of
+    the pipeline that depends on (recall, precision).
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+    custom_stats = pd.DataFrame(
+        index=stock_yearly.index,
+        columns=["mean", "std", "q05", "q95", "count", "achieved_recall", "achieved_precision"],
+        dtype=float,
+    )
+    for y in stock_yearly.index:
+        benchmark_return = bmk_yearly.get(y)
+        if pd.isna(benchmark_return):
+            continue
+        stats = simulate_custom_portfolio_distribution(
+            stock_yearly.loc[y].dropna(),
+            benchmark_return,
+            recall,
+            precision,
+            num_simulations,
+            label_threshold=label_threshold,
+            rng=rng,
+        )
+        for key, value in stats.items():
+            custom_stats.loc[y, key] = value
+    return custom_stats
+
+
+def run_top_n_study(
+    n_values: Iterable[int] = (1, 5, 10, 20, 50, 100),
+    year_start: int = 2000,
+    year_end: int = 2024,
+    benchmark: str = "SPY",
+    tickers: Optional[List[str]] = None,
+    tickers_by_year: Optional[Dict[int, List[str]]] = None,
+    model_recall: float = .2,
+    model_precision: float = 0.7,
+    num_simulations: int = 1000,
+    model_random_seed: Optional[int] = None,
+    label_threshold: Optional[float] = None,
+) -> StudyResult:
+    """
+    Main pipeline.
+
+    `label_threshold` sets the return the hypothetical classifier tries to identify
+    stocks as exceeding: a fixed absolute value (e.g. 0.1 for ">10% per year"), or
+    None to target beating that year's benchmark return. Portfolio performance is
+    always compared against the actual benchmark either way.
+    """
+    n_values = sorted(set(int(n) for n in n_values))
+    print("model_recall: ", model_recall)
+    print("model_precision: ", model_precision)
+    stock_yearly, bmk_yearly, coverage = prepare_universe_returns(
+        year_start,
+        year_end,
+        benchmark=benchmark,
+        tickers=tickers,
+        tickers_by_year=tickers_by_year,
+    )
 
     # Compute top-N returns per year
     by_n = pd.DataFrame(index=stock_yearly.index, columns=n_values, dtype=float)
@@ -549,28 +610,15 @@ def run_top_n_study(
         for n in n_values:
             by_n_bottom.loc[y, n] = bottom_n_portfolio_return(row, n)
     # Compute custom-N returns per year
-    custom_stats = pd.DataFrame(
-        index=stock_yearly.index,
-        columns=["mean", "std", "q05", "q95", "count", "achieved_recall", "achieved_precision"],
-        dtype=float,
+    custom_stats = compute_custom_stats(
+        stock_yearly,
+        bmk_yearly,
+        model_recall,
+        model_precision,
+        num_simulations,
+        label_threshold=label_threshold,
+        rng=np.random.default_rng(model_random_seed),
     )
-    rng = np.random.default_rng(model_random_seed)
-    for y in stock_yearly.index:
-        row = stock_yearly.loc[y]
-        benchmark_return = bmk_yearly.get(y)
-        if pd.isna(benchmark_return):
-            continue
-        stats = simulate_custom_portfolio_distribution(
-            row.dropna(),
-            benchmark_return,
-            model_recall,
-            model_precision,
-            num_simulations,
-            label_threshold=label_threshold,
-            rng=rng,
-        )
-        for key, value in stats.items():
-            custom_stats.loc[y, key] = value
 
     # Assemble metrics table
     yearly = pd.DataFrame(index=stock_yearly.index)
@@ -640,11 +688,60 @@ def run_top_n_study(
     )
 
 
+def sweep_from_returns(
+    stock_yearly: pd.DataFrame,
+    bmk_yearly: pd.Series,
+    recall_values: Iterable[float],
+    precision_values: Iterable[float],
+    *,
+    num_simulations: int = 5000,
+    model_random_seed: Optional[int] = None,
+    label_threshold: Optional[float] = None,
+) -> pd.DataFrame:
+    """
+    Grid-evaluate (recall, precision) pairs on precomputed per-year returns.
+    Only the classifier simulation is repeated per cell; the price data,
+    universe returns, and benchmark CAGR are shared across the whole grid.
+
+    Each cell reseeds its own RNG from `model_random_seed`, so a seeded sweep
+    is reproducible cell-by-cell regardless of grid shape or order.
+    """
+    cagr_benchmark = compute_cagr(bmk_yearly.reindex(stock_yearly.index))
+    rows = []
+    for recall in recall_values:
+        for precision in precision_values:
+            custom_stats = compute_custom_stats(
+                stock_yearly,
+                bmk_yearly,
+                recall,
+                precision,
+                num_simulations,
+                label_threshold=label_threshold,
+                rng=np.random.default_rng(model_random_seed),
+            )
+            cagr_custom_q05 = compute_cagr(custom_stats["q05"])
+            rows.append(
+                {
+                    "recall": recall,
+                    "precision": precision,
+                    "achieved_recall_mean": float(custom_stats["achieved_recall"].mean()),
+                    "achieved_precision_mean": float(custom_stats["achieved_precision"].mean()),
+                    "cagr_custom_q05": cagr_custom_q05,
+                    "cagr_benchmark": cagr_benchmark,
+                    "custom_q05_meets_benchmark": bool(
+                        not pd.isna(cagr_custom_q05)
+                        and not pd.isna(cagr_benchmark)
+                        and cagr_custom_q05 >= cagr_benchmark
+                    ),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
 def sweep_recall_precision_pairs(
     recall_values: Iterable[float],
     precision_values: Iterable[float],
     *,
-    n_values: Iterable[int] = (1, 5, 10, 20, 50, 100),
     year_start: int = 2000,
     year_end: int = 2024,
     benchmark: str = "SPY",
@@ -657,57 +754,30 @@ def sweep_recall_precision_pairs(
 ) -> pd.DataFrame:
     """
     Evaluate a grid of (recall, precision) pairs and report where custom q05 CAGR
-    meets or exceeds the benchmark CAGR.
+    meets or exceeds the benchmark CAGR. Prices and per-year universe returns are
+    computed once and reused for every grid cell.
 
     See run_top_n_study for the meaning of `label_threshold`. Pass
     `output_csv=None` to skip writing the results to disk.
     """
-    rows = []
-    for recall in recall_values:
-        for precision in precision_values:
-            study = run_top_n_study(
-                n_values=n_values,
-                year_start=year_start,
-                year_end=year_end,
-                benchmark=benchmark,
-                tickers=tickers,
-                tickers_by_year=tickers_by_year,
-                model_recall=recall,
-                model_precision=precision,
-                num_simulations=num_simulations,
-                model_random_seed=model_random_seed,
-                label_threshold=label_threshold,
-            )
-            summary = study.summary
-            if summary.empty:
-                rows.append(
-                    {
-                        "recall": recall,
-                        "precision": precision,
-                        "achieved_recall_mean": np.nan,
-                        "achieved_precision_mean": np.nan,
-                        "cagr_custom_q05": np.nan,
-                        "cagr_benchmark": np.nan,
-                        "custom_q05_meets_benchmark": False,
-                    }
-                )
-                continue
-            cagr_custom_q05 = float(summary["cagr_custom_q05"].iloc[0])
-            cagr_benchmark = float(summary["cagr_benchmark"].iloc[0])
-            rows.append(
-                {
-                    "recall": recall,
-                    "precision": precision,
-                    "achieved_recall_mean": float(summary["custom_recall_mean"].iloc[0]),
-                    "achieved_precision_mean": float(summary["custom_precision_mean"].iloc[0]),
-                    "cagr_custom_q05": cagr_custom_q05,
-                    "cagr_benchmark": cagr_benchmark,
-                    "custom_q05_meets_benchmark": cagr_custom_q05 >= cagr_benchmark,
-                }
-            )
+    stock_yearly, bmk_yearly, _ = prepare_universe_returns(
+        year_start,
+        year_end,
+        benchmark=benchmark,
+        tickers=tickers,
+        tickers_by_year=tickers_by_year,
+    )
+    df = sweep_from_returns(
+        stock_yearly,
+        bmk_yearly,
+        recall_values,
+        precision_values,
+        num_simulations=num_simulations,
+        model_random_seed=model_random_seed,
+        label_threshold=label_threshold,
+    ).round(4)
     pd.set_option("display.width", 140)
     pd.set_option("display.max_columns", 50)
-    df = pd.DataFrame(rows).round(4)
     print(df)
     if output_csv:
         df.to_csv(output_csv)
@@ -807,12 +877,84 @@ def plot_investment_growth(res: StudyResult, n_values, initial_investment: float
     plt.savefig("topNAndCustom_growth.png", dpi=150, bbox_inches="tight")
     plt.close()
 
+
+def plot_sweep_heatmap(
+    sweep_df: pd.DataFrame,
+    output_path: str = "recall_precision_heatmap.png",
+) -> None:
+    """
+    Heatmap of the sweep grid: precision (rows) x recall (columns), colored by
+    q05 CAGR minus benchmark CAGR. Blue cells are pairs whose 5th-percentile
+    portfolio CAGR beats the benchmark, red cells fall short, the gray midpoint
+    is dead even. Cells where the pair was infeasible (no reachable selection,
+    so no q05) render in flat gray with "n/a".
+    """
+    from matplotlib.colors import LinearSegmentedColormap
+
+    excess = sweep_df["cagr_custom_q05"] - sweep_df["cagr_benchmark"]
+    grid = (
+        sweep_df.assign(excess=excess)
+        .pivot(index="precision", columns="recall", values="excess")
+        .sort_index()
+        .sort_index(axis=1)
+    )
+    values = np.ma.masked_invalid(grid.to_numpy(dtype=float))
+    # Symmetric range so the gray midpoint always sits at exactly zero excess.
+    span = float(np.abs(values).max()) if values.count() else 0.0
+    span = max(span, 1e-6)
+
+    cmap = LinearSegmentedColormap.from_list(
+        "excess_diverging", ["#e34948", "#f0efec", "#2a78d6"]
+    )
+    cmap.set_bad("#e1e0d9")
+
+    n_rows, n_cols = grid.shape
+    fig, ax = plt.subplots(
+        figsize=(2.2 + 1.1 * n_cols, 1.6 + 0.75 * n_rows)
+    )
+    mesh = ax.pcolormesh(
+        values,
+        cmap=cmap,
+        vmin=-span,
+        vmax=span,
+        edgecolors="white",
+        linewidth=2,
+    )
+
+    for i in range(n_rows):
+        for j in range(n_cols):
+            if values.mask is not np.ma.nomask and values.mask[i, j]:
+                label, ink = "n/a", "#52514e"
+            else:
+                v = float(values[i, j])
+                label = f"{v:+.1%}"
+                r, g, b, _ = cmap((v + span) / (2 * span))
+                ink = "white" if (0.299 * r + 0.587 * g + 0.114 * b) < 0.5 else "#0b0b0b"
+            ax.text(j + 0.5, i + 0.5, label, ha="center", va="center",
+                    color=ink, fontsize=9)
+
+    ax.set_xticks(np.arange(n_cols) + 0.5)
+    ax.set_xticklabels([f"{r:g}" for r in grid.columns])
+    ax.set_yticks(np.arange(n_rows) + 0.5)
+    ax.set_yticklabels([f"{p:g}" for p in grid.index])
+    ax.set_xlabel("Target recall")
+    ax.set_ylabel("Target precision")
+    ax.set_title("Worst-case (q05) CAGR vs benchmark by (recall, precision)")
+    ax.tick_params(length=0)
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+
+    cbar = fig.colorbar(mesh, ax=ax)
+    cbar.set_label("q05 CAGR − benchmark CAGR")
+    cbar.ax.yaxis.set_major_formatter(lambda v, _: f"{v:+.0%}")
+    cbar.outline.set_visible(False)
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close()
+
 def build_parser() -> argparse.ArgumentParser:
     common = argparse.ArgumentParser(add_help=False)
-    common.add_argument(
-        "--n-values", type=int, nargs="+", default=[100, 250], metavar="N",
-        help="Top-N portfolio sizes to evaluate (default: %(default)s).",
-    )
     common.add_argument(
         "--year-start", type=int, default=2012,
         help="First calendar year of the study (default: %(default)s).",
@@ -846,6 +988,10 @@ def build_parser() -> argparse.ArgumentParser:
     study = sub.add_parser(
         "study", parents=[common],
         help="Run the top-N study once for a single (recall, precision) pair and write plots.",
+    )
+    study.add_argument(
+        "--n-values", type=int, nargs="+", default=[100, 250], metavar="N",
+        help="Top-N portfolio sizes to evaluate (default: %(default)s).",
     )
     study.add_argument(
         "--recall", type=float, default=0.2,
@@ -889,6 +1035,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--output", default="Precision_Recall_Tradeoff.csv",
         help="CSV path for the sweep results (default: %(default)s).",
     )
+    sweep.add_argument(
+        "--no-plots", action="store_true",
+        help="Skip writing the heatmap PNG.",
+    )
 
     return parser
 
@@ -923,10 +1073,9 @@ def run_study_command(args: argparse.Namespace) -> None:
 
 
 def run_sweep_command(args: argparse.Namespace) -> None:
-    sweep_recall_precision_pairs(
+    df = sweep_recall_precision_pairs(
         recall_values=args.recalls,
         precision_values=args.precisions,
-        n_values=args.n_values,
         year_start=args.year_start,
         year_end=args.year_end,
         benchmark=args.benchmark,
@@ -935,6 +1084,8 @@ def run_sweep_command(args: argparse.Namespace) -> None:
         label_threshold=args.label_threshold,
         output_csv=args.output,
     )
+    if not args.no_plots:
+        plot_sweep_heatmap(df)
 
 
 def main(argv: Optional[List[str]] = None) -> None:
