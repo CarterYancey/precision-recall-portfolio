@@ -166,11 +166,112 @@ def test_threading_through_stats_and_sweep() -> None:
     assert np.isclose(df.loc[0, "excluded_top_mean"], expected.mean())
 
 
+def test_uniform_baseline_in_sweep() -> None:
+    rng = np.random.default_rng(7)
+    years = list(range(2016, 2023))
+    tickers = [f"T{i:03d}" for i in range(70)]
+    stock_yearly = pd.DataFrame(
+        rng.normal(0.08, 0.25, size=(len(years), len(tickers))),
+        index=years, columns=tickers,
+    )
+    stock_yearly.index.name = "year"
+    bmk_yearly = pd.Series(0.07, index=years)
+    grid = dict(num_simulations=100, model_random_seed=42)
+
+    df_uni = sweep_from_returns(stock_yearly, bmk_yearly, [0.2, 0.4], [0.6, 0.8], **grid)
+    df_excl = sweep_from_returns(
+        stock_yearly, bmk_yearly, [0.2, 0.4], [0.6, 0.8], exclude_top=0.25, **grid
+    )
+
+    # Baseline columns exist only when the mode is on.
+    uniform_cols = [
+        "cagr_custom_q05_uniform", "custom_q05_gap",
+        "custom_q05_meets_benchmark_uniform", "custom_q05_meets_ew_benchmark_uniform",
+    ]
+    for col in uniform_cols:
+        assert col not in df_uni.columns
+        assert col in df_excl.columns
+
+    # Paired seeding: the embedded baseline reproduces a plain sweep exactly.
+    assert np.allclose(
+        df_excl["cagr_custom_q05_uniform"], df_uni["cagr_custom_q05"], equal_nan=True
+    )
+    assert (
+        df_excl["custom_q05_meets_benchmark_uniform"]
+        == df_uni["custom_q05_meets_benchmark"]
+    ).all()
+    assert (
+        df_excl["custom_q05_meets_ew_benchmark_uniform"]
+        == df_uni["custom_q05_meets_ew_benchmark"]
+    ).all()
+
+    # gap = uniform - excluded, NaN-propagating.
+    both = df_excl["cagr_custom_q05_uniform"] - df_excl["cagr_custom_q05"]
+    assert np.allclose(df_excl["custom_q05_gap"], both, equal_nan=True)
+
+
+def test_uniform_baseline_in_study() -> None:
+    """Fabricate a price cache (as in smoke_test.py) so run_top_n_study runs
+    offline, and check the uniform baseline rides along when exclude_top is on."""
+    import os
+    import tempfile
+
+    from pickn import run_top_n_study
+
+    tickers = [f"T{i:02d}" for i in range(30)]
+    all_cols = tickers + ["SPY"]
+    dates = pd.bdate_range("2020-01-02", "2021-12-31")
+    rng = np.random.default_rng(0)
+    prices = pd.DataFrame(
+        100 * np.exp(np.cumsum(rng.normal(0.0004, 0.02, size=(len(dates), len(all_cols))), axis=0)),
+        index=dates,
+        columns=all_cols,
+    )
+
+    common = dict(
+        n_values=[5], year_start=2020, year_end=2021, tickers=tickers,
+        model_recall=0.2, model_precision=0.7, num_simulations=100,
+        model_random_seed=42,
+    )
+    cwd = os.getcwd()
+    with tempfile.TemporaryDirectory() as tmp:
+        os.chdir(tmp)
+        try:
+            prices.to_csv("adj_close_cache.csv", index_label="Date")
+            res_uni = run_top_n_study(**common)
+            res_excl = run_top_n_study(**common, exclude_top=0.1)
+        finally:
+            os.chdir(cwd)
+
+    # Off: no baseline frame, no *_uniform summary columns.
+    assert res_uni.custom_stats_uniform is None
+    assert "avg_custom_mean_gap" not in res_uni.summary.columns
+
+    # On: baseline frame present, unexcluded, and (same seed) it reproduces
+    # the plain run's distribution.
+    baseline = res_excl.custom_stats_uniform
+    assert baseline is not None
+    assert (baseline["excluded_top"] == 0).all()
+    assert np.allclose(baseline["mean"], res_uni.custom_stats["mean"], equal_nan=True)
+    assert (res_excl.custom_stats["excluded_top"] >= 1).all()
+
+    gap = (baseline["mean"] - res_excl.custom_stats["mean"]).mean()
+    for col in (
+        "cagr_custom_mean_uniform", "cagr_custom_q05_uniform",
+        "cagr_custom_q95_uniform", "avg_custom_mean_return_uniform",
+        "avg_custom_mean_gap",
+    ):
+        assert col in res_excl.summary.columns
+    assert np.allclose(res_excl.summary["avg_custom_mean_gap"], gap)
+
+
 def main() -> None:
     test_resolve_top_exclusion_count()
     test_distribution_excludes_super_performers()
     test_infeasible_when_pool_cannot_fill_quota()
     test_threading_through_stats_and_sweep()
+    test_uniform_baseline_in_sweep()
+    test_uniform_baseline_in_study()
     print("All exclude_top tests passed.")
 
 
