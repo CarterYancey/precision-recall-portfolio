@@ -49,7 +49,8 @@ def test_sweep_grid_shape_and_flags() -> None:
     assert list(df.columns) == [
         "recall", "precision", "achieved_recall_mean", "achieved_precision_mean",
         "base_rate_mean", "base_rate_min", "base_rate_max", "precision_edge_mean",
-        "cagr_custom_q05", "cagr_benchmark", "custom_q05_meets_benchmark",
+        "cagr_custom_q05", "cagr_benchmark", "cagr_ew_benchmark",
+        "custom_q05_meets_benchmark", "custom_q05_meets_ew_benchmark",
     ]
     # Full cross product, recall-major order (matches the CSV consumers expect).
     assert df[["recall", "precision"]].values.tolist() == [
@@ -57,13 +58,20 @@ def test_sweep_grid_shape_and_flags() -> None:
     ]
 
     bmk_cagr = compute_cagr(bmk_yearly)
+    ew_cagr = compute_cagr(stock_yearly.mean(axis=1))
     assert (df["cagr_benchmark"] == bmk_cagr).all()
+    assert (df["cagr_ew_benchmark"] == ew_cagr).all()
     for _, row in df.iterrows():
         expected = (
             not pd.isna(row["cagr_custom_q05"])
             and row["cagr_custom_q05"] >= row["cagr_benchmark"]
         )
         assert row["custom_q05_meets_benchmark"] == expected
+        expected_ew = (
+            not pd.isna(row["cagr_custom_q05"])
+            and row["cagr_custom_q05"] >= row["cagr_ew_benchmark"]
+        )
+        assert row["custom_q05_meets_ew_benchmark"] == expected_ew
 
 
 def test_base_rate_reporting() -> None:
@@ -152,6 +160,15 @@ def test_heatmap_written_with_nan_cell() -> None:
         out2 = Path(tmp) / "heatmap_all_nan.png"
         plot_sweep_heatmap(all_nan, output_path=str(out2))
         assert out2.exists() and out2.stat().st_size > 0
+
+        # Same grid rendered against the equal-weight universe benchmark.
+        out3 = Path(tmp) / "heatmap_ew.png"
+        plot_sweep_heatmap(
+            df, output_path=str(out3),
+            benchmark_col="cagr_ew_benchmark",
+            benchmark_name="equal-weight universe",
+        )
+        assert out3.exists() and out3.stat().st_size > 0
 
 
 def main() -> None:

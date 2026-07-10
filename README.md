@@ -15,9 +15,9 @@ This project explores how portfolios composed of the top-performing S&P 500 stoc
 | `constituents.py` | Optional utility (not imported by the other scripts): fetches point-in-time S&P 500 membership from historical Wikipedia revisions and caches it to `sp500_constituents_wikipedia_by_year.csv`. Run as a CLI: `uv run python constituents.py --year-start 2000 --year-end 2024`. |
 | `SP500_HistoricalComponents_withChanges.csv` | **Large (~5.3 MB, ~2,700 rows).** Point-in-time S&P 500 membership, 1996-01-02 through 2025-11-11. One row per change date; columns are `date` and `tickers` (a single comma-separated string of ~500 tickers). Used by `get_sp500_tickers_by_year` to reduce survivorship bias. Don't open it casually — see `CLAUDE.md`. |
 | `SP500Current.csv` | Current S&P 500 ticker list (one `Symbol` column, ~505 rows). Used by `get_sp500_tickers_from_csv` as a simpler, survivorship-biased universe. |
-| `Precision_Recall_Tradeoff.csv` | Output of `sweep_recall_precision_pairs`: for each (recall, precision) pair, the 5th-percentile CAGR of the simulated portfolios vs. the benchmark CAGR. |
+| `Precision_Recall_Tradeoff.csv` | Output of `sweep_recall_precision_pairs`: for each (recall, precision) pair, the 5th-percentile CAGR of the simulated portfolios vs. the benchmark CAGR (cap-weighted SPY and the equal-weighted universe mean). |
 | `adj_close_cache.csv` | Generated at runtime (gitignored). Cached adjusted-close prices from yfinance. |
-| `*.png` | Generated at runtime (gitignored). `topNAndCustom_vs_spy.png` (yearly returns) and `topNAndCustom_growth.png` (growth of $100). |
+| `*.png` | Generated at runtime (gitignored). `topNAndCustom_vs_spy.png` (yearly returns) and `topNAndCustom_growth.png` (growth of $100) from `study`; `recall_precision_heatmap.png` and `recall_precision_heatmap_ew.png` (q05 CAGR excess vs the cap-weighted / equal-weight benchmark) from `sweep`. |
 | `TODO.md` | Known issues and planned improvements. |
 | `CLAUDE.md` | Notes for AI coding assistants working in this repo. |
 
@@ -47,6 +47,7 @@ With default options, the script:
 - Studies years **2012–2024** with `n_values = [100, 250]` against the SPY benchmark.
 - Runs repeated model simulations (default: recall 0.2, precision 0.7, up to 1000 draws per year) to summarize the simulated portfolio's return distribution (mean, std, 5–95% band).
 - Prints a per-year universe coverage / survivorship report (constituents with no price data, mid-year delistings kept at last price, mid-year data starts excluded), an N-level summary table, and recent yearly metrics to stdout. The yearly table includes `label_base_rate` — the label prevalence `T/(T+F)`, i.e. the precision a dart-throwing picker gets for free that year — and the summary reports `label_base_rate_mean/min/max` plus `custom_precision_edge_mean` (achieved precision minus base rate), so precision reads as skill over chance rather than an absolute number.
+- Reports performance against **two benchmarks**: the cap-weighted `--benchmark` ticker (SPY) and the **equal-weighted universe mean** (per-year mean return of all constituents with data). The simulated portfolios are equal-weighted, so excess over SPY mixes selection skill with the equal-weight/size effect; excess over the equal-weight benchmark isolates skill. The yearly table carries `ew_benchmark_return` and per-N `top{n}_excess_ew`, the summary `avg_ew_benchmark_return`/`avg_excess_ew`/`cagr_ew_benchmark`, and both plots draw the equal-weight benchmark as a dashed line. (Labeling with the default `label_threshold` still targets the cap-weighted benchmark's return.)
 - Saves two plots: `topNAndCustom_vs_spy.png` (yearly returns with the simulated-model band) and `topNAndCustom_growth.png` (value of $100 reinvested annually).
 
 To customize, pass CLI flags to the `study` subcommand (see `uv run python pickn.py study --help` for the full list):
@@ -60,7 +61,7 @@ Other useful flags: `--benchmark` (default SPY), `--label-threshold` (label stoc
 
 ## Sweeping recall/precision pairs
 
-The `sweep` subcommand evaluates a grid of (recall, precision) pairs, reporting for each whether the 5th-percentile CAGR of the simulated portfolios meets or exceeds the benchmark CAGR. Results are printed and written to `Precision_Recall_Tradeoff.csv` (override with `--output`).
+The `sweep` subcommand evaluates a grid of (recall, precision) pairs, reporting for each whether the 5th-percentile CAGR of the simulated portfolios meets or exceeds the benchmark CAGR — against both the cap-weighted benchmark (`cagr_benchmark`, `custom_q05_meets_benchmark`) and the equal-weighted universe mean (`cagr_ew_benchmark`, `custom_q05_meets_ew_benchmark`). Results are printed and written to `Precision_Recall_Tradeoff.csv` (override with `--output`), and plotted as two heatmaps: `recall_precision_heatmap.png` (excess vs the cap-weighted benchmark) and `recall_precision_heatmap_ew.png` (excess vs the equal-weight universe); skip with `--no-plots`.
 
 ```bash
 uv run python pickn.py sweep --recalls 0.1 0.2 0.3 --precisions 0.5 0.6 0.7 0.8 0.9
