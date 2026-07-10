@@ -46,7 +46,7 @@ With default options, the script:
 - Uses year-specific S&P 500 membership from `SP500_HistoricalComponents_withChanges.csv` (first membership snapshot of each year) to reduce survivorship bias.
 - Studies years **2012–2024** with `n_values = [100, 250]` against the SPY benchmark.
 - Runs repeated model simulations (default: recall 0.2, precision 0.7, up to 1000 draws per year) to summarize the simulated portfolio's return distribution (mean, std, 5–95% band).
-- Prints a per-year universe coverage / survivorship report (constituents with no price data, mid-year delistings kept at last price, mid-year data starts excluded), an N-level summary table, and recent yearly metrics to stdout.
+- Prints a per-year universe coverage / survivorship report (constituents with no price data, mid-year delistings kept at last price, mid-year data starts excluded), an N-level summary table, and recent yearly metrics to stdout. The yearly table includes `label_base_rate` — the label prevalence `T/(T+F)`, i.e. the precision a dart-throwing picker gets for free that year — and the summary reports `label_base_rate_mean/min/max` plus `custom_precision_edge_mean` (achieved precision minus base rate), so precision reads as skill over chance rather than an absolute number.
 - Saves two plots: `topNAndCustom_vs_spy.png` (yearly returns with the simulated-model band) and `topNAndCustom_growth.png` (value of $100 reinvested annually).
 
 To customize, pass CLI flags to the `study` subcommand (see `uv run python pickn.py study --help` for the full list):
@@ -66,9 +66,21 @@ The `sweep` subcommand evaluates a grid of (recall, precision) pairs, reporting 
 uv run python pickn.py sweep --recalls 0.1 0.2 0.3 --precisions 0.5 0.6 0.7 0.8 0.9
 ```
 
-The grid defaults to recalls `0.1 0.2 0.3` × precisions `0.5 0.6 0.7 0.8`, and the shared study flags (`--n-values`, `--year-start`/`--year-end`, `--benchmark`, `--seed`, `--label-threshold`, `--num-simulations`) apply here too — see `uv run python pickn.py sweep --help`.
+The grid defaults to recalls `0.1 0.2 0.3` × precisions `0.5 0.6 0.7 0.8`, and the shared study flags (`--year-start`/`--year-end`, `--benchmark`, `--seed`, `--label-threshold`, `--num-simulations`) apply here too — see `uv run python pickn.py sweep --help`.
 
-Note this re-runs the full study per grid cell, so it is slow on the first (uncached) run.
+Each output row also carries the label base rate (`base_rate_mean/min/max` — prevalence `T/(T+F)`, identical across grid cells since it depends only on the labeling threshold) and `precision_edge_mean` (achieved precision minus base rate): "precision *p* suffices" is only evidence of a strong model where that edge is large, and with a fixed absolute `--label-threshold` the base rate collapses in bear years, which the per-year column in `custom_stats` makes visible.
+
+Prices and per-year universe returns are computed once and shared across the grid; only the classifier simulation is re-run per cell. The first (uncached) run is still slow because of the price download.
+
+## Screening labeling criteria (`screen`)
+
+Before asking what (recall, precision) a criterion needs, check whether the criterion can work at all: the `screen` subcommand computes, per year, the return of the **perfect-classifier portfolio** (precision = 1.0, recall = 1.0 — the equal-weighted mean of every stock meeting the criterion). If even that portfolio doesn't beat the benchmark, no precision level rescues the criterion.
+
+```bash
+uv run python pickn.py screen --criteria 0 0.1 bmk bmk+0.1
+```
+
+Criterion specs are absolute return thresholds (`0`, `0.1` for >10%) or benchmark-relative (`bmk`, `bmk+0.1`, `bmk-0.05`). The command prints a per-year table (criterion × {threshold, positives, base rate, positive-set mean return, benchmark return, excess}, also written to `Criterion_Feasibility.csv`, override with `--output`) and a per-criterion summary with `cagr_perfect` vs `cagr_benchmark` and a `passes_screen` verdict. Passing is a **necessary condition only**: a low-recall draw centers on the same mean but with real variance, and right-skewed positive returns put the typical draw below it — the risk analysis starts where the screen ends. This needs no selection simulation, so it's fast once prices are cached.
 
 ## Simulating recall/precision selections
 

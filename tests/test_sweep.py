@@ -48,6 +48,7 @@ def test_sweep_grid_shape_and_flags() -> None:
     assert len(df) == len(recalls) * len(precisions)
     assert list(df.columns) == [
         "recall", "precision", "achieved_recall_mean", "achieved_precision_mean",
+        "base_rate_mean", "base_rate_min", "base_rate_max", "precision_edge_mean",
         "cagr_custom_q05", "cagr_benchmark", "custom_q05_meets_benchmark",
     ]
     # Full cross product, recall-major order (matches the CSV consumers expect).
@@ -63,6 +64,44 @@ def test_sweep_grid_shape_and_flags() -> None:
             and row["cagr_custom_q05"] >= row["cagr_benchmark"]
         )
         assert row["custom_q05_meets_benchmark"] == expected
+
+
+def test_base_rate_reporting() -> None:
+    stock_yearly, bmk_yearly = make_returns()
+    df = sweep_from_returns(
+        stock_yearly, bmk_yearly, [0.1, 0.3], [0.5, 0.9],
+        num_simulations=20, model_random_seed=5,
+    )
+
+    # Prevalence depends only on the labeling threshold, so it must be
+    # identical across grid cells and match a direct recomputation.
+    per_year = pd.Series(
+        {
+            y: float((stock_yearly.loc[y].dropna() > bmk_yearly[y]).mean())
+            for y in stock_yearly.index
+        }
+    )
+    assert np.allclose(df["base_rate_mean"], per_year.mean())
+    assert np.allclose(df["base_rate_min"], per_year.min())
+    assert np.allclose(df["base_rate_max"], per_year.max())
+    assert np.allclose(
+        df["precision_edge_mean"],
+        df["achieved_precision_mean"] - df["base_rate_mean"],
+        atol=1e-9,
+    )
+
+    # A fixed absolute threshold changes the prevalence accordingly.
+    df_abs = sweep_from_returns(
+        stock_yearly, bmk_yearly, [0.3], [0.9],
+        num_simulations=20, model_random_seed=5, label_threshold=0.5,
+    )
+    per_year_abs = pd.Series(
+        {
+            y: float((stock_yearly.loc[y].dropna() > 0.5).mean())
+            for y in stock_yearly.index
+        }
+    )
+    assert np.allclose(df_abs["base_rate_mean"], per_year_abs.mean())
 
 
 def test_sweep_seed_reproducible() -> None:
@@ -117,6 +156,7 @@ def test_heatmap_written_with_nan_cell() -> None:
 
 def main() -> None:
     test_sweep_grid_shape_and_flags()
+    test_base_rate_reporting()
     test_sweep_seed_reproducible()
     test_perfect_precision_beats_benchmark()
     test_heatmap_written_with_nan_cell()

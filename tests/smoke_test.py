@@ -48,10 +48,12 @@ for col in res.summary.columns:
 assert "achieved_recall" in res.custom_stats.columns
 assert "achieved_precision" in res.custom_stats.columns
 assert res.custom_stats["achieved_recall"].notna().any()
+assert "base_rate" in res.custom_stats.columns
+assert res.custom_stats["base_rate"].between(0, 1).all()
+assert "label_base_rate" in res.yearly.columns
 
 df = sweep_recall_precision_pairs(
     [0.3], [0.5],
-    n_values=[2],
     year_start=2020,
     year_end=2021,
     tickers=tickers,
