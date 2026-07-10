@@ -933,10 +933,17 @@ def screen_label_criteria(
     same mean but with real variance, and right-skewed positive returns put
     the typical draw below it — the risk analysis starts where this ends.
 
+    Excess is reported against both benchmarks: the cap-weighted `bmk_yearly`
+    (SPY) and the equal-weighted universe mean, which shares the perfect
+    portfolio's weighting scheme — beating only the former may just be the
+    equal-weight effect. `bmk`-relative criteria still threshold against the
+    cap-weighted benchmark; only the comparison gains the second baseline.
+
     `criteria` items are spec strings (see parse_criterion) or already-parsed
     (kind, value) tuples. Returns a long DataFrame, one row per
     (criterion, year): threshold, num_positive, base_rate,
-    positive_mean_return, benchmark_return, excess.
+    positive_mean_return, benchmark_return, ew_benchmark_return, excess,
+    excess_ew.
     """
     rows = []
     for spec in criteria:
@@ -949,6 +956,7 @@ def screen_label_criteria(
             returns = stock_yearly.loc[y].dropna()
             if returns.empty:
                 continue
+            ew_bmk = float(returns.mean())
             threshold = bmk + value if kind == "benchmark" else value
             positives = returns[returns > threshold]
             mean_pos = float(positives.mean()) if len(positives) else np.nan
@@ -961,7 +969,9 @@ def screen_label_criteria(
                     "base_rate": float(len(positives) / len(returns)),
                     "positive_mean_return": mean_pos,
                     "benchmark_return": float(bmk),
+                    "ew_benchmark_return": ew_bmk,
                     "excess": mean_pos - float(bmk),
+                    "excess_ew": mean_pos - ew_bmk,
                 }
             )
     return pd.DataFrame(rows)
@@ -971,6 +981,10 @@ def summarize_screen(screen_df: pd.DataFrame) -> pd.DataFrame:
     """
     Per-criterion verdict on the necessary condition: does the perfect
     (precision=1, recall=1) portfolio beat the benchmark across the period?
+    Verdicts come in pairs — ``passes_screen`` against the cap-weighted
+    benchmark and ``passes_screen_ew`` against the equal-weighted universe
+    mean; only the latter isolates selection value from the equal-weight
+    effect, since the perfect portfolio is itself equal-weighted.
 
     ``cagr_perfect`` compounds only years with a non-empty positive set
     (compute_cagr drops NaN years, mirroring the study's current no-pick
@@ -981,6 +995,7 @@ def summarize_screen(screen_df: pd.DataFrame) -> pd.DataFrame:
         by_year = grp.set_index("year")
         cagr_perfect = compute_cagr(by_year["positive_mean_return"])
         cagr_benchmark = compute_cagr(by_year["benchmark_return"])
+        cagr_ew_benchmark = compute_cagr(by_year["ew_benchmark_return"])
         rows.append(
             {
                 "criterion": name,
@@ -990,14 +1005,23 @@ def summarize_screen(screen_df: pd.DataFrame) -> pd.DataFrame:
                 "base_rate_min": float(grp["base_rate"].min()),
                 "avg_positive_mean_return": float(grp["positive_mean_return"].mean()),
                 "avg_benchmark_return": float(grp["benchmark_return"].mean()),
+                "avg_ew_benchmark_return": float(grp["ew_benchmark_return"].mean()),
                 "avg_excess": float(grp["excess"].mean()),
+                "avg_excess_ew": float(grp["excess_ew"].mean()),
                 "years_beating_benchmark": int((grp["excess"] > 0).sum()),
+                "years_beating_ew_benchmark": int((grp["excess_ew"] > 0).sum()),
                 "cagr_perfect": cagr_perfect,
                 "cagr_benchmark": cagr_benchmark,
+                "cagr_ew_benchmark": cagr_ew_benchmark,
                 "passes_screen": bool(
                     not pd.isna(cagr_perfect)
                     and not pd.isna(cagr_benchmark)
                     and cagr_perfect > cagr_benchmark
+                ),
+                "passes_screen_ew": bool(
+                    not pd.isna(cagr_perfect)
+                    and not pd.isna(cagr_ew_benchmark)
+                    and cagr_perfect > cagr_ew_benchmark
                 ),
             }
         )
@@ -1397,10 +1421,13 @@ def run_screen_command(args: argparse.Namespace) -> None:
     print("\n=== Screen summary by criterion ===")
     print(summary.round(4).to_string())
     print(
-        "\npasses_screen: the perfect-classifier CAGR beats the benchmark CAGR. "
-        "This is a necessary condition only — low-recall draws spread around the "
-        "same yearly mean with real variance, and right-skewed positive returns "
-        "put the typical draw below it."
+        "\npasses_screen: the perfect-classifier CAGR beats the cap-weighted "
+        "benchmark CAGR; passes_screen_ew: it beats the equal-weighted universe "
+        "mean, which shares the portfolio's weighting scheme — passing only the "
+        "former may just be the equal-weight effect. Both are necessary "
+        "conditions only — low-recall draws spread around the same yearly mean "
+        "with real variance, and right-skewed positive returns put the typical "
+        "draw below it."
     )
 
 
