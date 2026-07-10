@@ -327,41 +327,89 @@ def simulate_year_model_selection(
     )
 
 
-def top_n_portfolio_return(year_returns: pd.Series, n: int) -> float:
+def portfolio_return(returns: pd.Series, weights: Optional[pd.Series] = None) -> float:
     """
-    Equal-weight return of top-n stocks for that year (ignores missing).
+    Aggregate constituent returns into one portfolio return.
+
+    Equal weight when `weights` is None. Otherwise `weights` is a
+    ticker-indexed series (e.g. point-in-time market caps for a cap-weighted
+    portfolio); constituents without a positive weight are dropped and the
+    remaining weights renormalized. yfinance provides no historical share
+    counts, so nothing in the pipeline passes weights yet — the argument
+    exists so a survivorship-bias-free provider (Sharadar) can plug in
+    without touching the portfolio construction call sites.
+    """
+    if weights is None:
+        return float(returns.mean())
+    w = weights.reindex(returns.index)
+    w = w[w > 0]
+    if w.empty:
+        return np.nan
+    selected = returns.reindex(w.index)
+    return float((selected * w).sum() / w.sum())
+
+
+def equal_weight_benchmark_returns(stock_yearly: pd.DataFrame) -> pd.Series:
+    """
+    Per-year return of the equal-weighted universe portfolio (mean over that
+    year's constituents with data).
+
+    The simulated portfolios are equal-weighted while SPY is cap-weighted, so
+    excess over SPY mixes model skill with the equal-weight/size effect. This
+    internal benchmark carries the same survivorship bias as the portfolios
+    themselves (unlike RSP), so excess over it isolates selection skill from
+    the weighting scheme.
+    """
+    ew = stock_yearly.mean(axis=1)
+    ew.name = "ew_benchmark"
+    return ew
+
+
+def top_n_portfolio_return(
+    year_returns: pd.Series, n: int, weights: Optional[pd.Series] = None
+) -> float:
+    """
+    Return of top-n stocks for that year (ignores missing). Selection is
+    always by return; `weights` only changes the aggregation (see
+    portfolio_return), defaulting to equal weight.
     """
     yr = year_returns.dropna()
     if yr.empty:
         return np.nan
     n_eff = min(n, len(yr))
     top = yr.nlargest(n_eff)
-    return float(top.mean())
+    return portfolio_return(top, weights)
 
-def bottom_n_portfolio_return(year_returns: pd.Series, n: int) -> float:
+def bottom_n_portfolio_return(
+    year_returns: pd.Series, n: int, weights: Optional[pd.Series] = None
+) -> float:
     """
-    Equal-weight return of bottom-n stocks for that year (ignores missing).
+    Return of bottom-n stocks for that year (ignores missing). Selection is
+    always by return; `weights` only changes the aggregation (see
+    portfolio_return), defaulting to equal weight.
     """
     yr = year_returns.dropna()
     if yr.empty:
         return np.nan
     n_eff = min(n, len(yr))
     bottom = yr.nsmallest(n_eff)
-    return float(bottom.mean())
+    return portfolio_return(bottom, weights)
 
 def model_selected_portfolio_return(
     year_returns: pd.Series,
     selected_names: List[str],
+    weights: Optional[pd.Series] = None,
 ) -> float:
     """
-    Equal-weight return of model-selected stocks for that year (ignores missing).
+    Return of model-selected stocks for that year (ignores missing).
+    Equal-weighted unless `weights` is given (see portfolio_return).
     """
     if not selected_names:
         return np.nan
     selected = year_returns.reindex(selected_names).dropna()
     if selected.empty:
         return np.nan
-    return float(selected.mean())
+    return portfolio_return(selected, weights)
 
 
 def simulate_custom_portfolio_distribution(
@@ -636,6 +684,11 @@ def run_top_n_study(
     # Assemble metrics table
     yearly = pd.DataFrame(index=stock_yearly.index)
     yearly["benchmark_return"] = bmk_yearly.reindex(yearly.index)
+    # Equal-weighted universe mean: the portfolios are equal-weighted, so
+    # excess over this disentangles selection skill from the equal-weight
+    # effect baked into excess over cap-weighted SPY.
+    ew_yearly = equal_weight_benchmark_returns(stock_yearly)
+    yearly["ew_benchmark_return"] = ew_yearly
     # Label prevalence T/(T+F): the precision a dart-throwing picker gets for
     # free that year, next to the results so precision reads as skill-over-chance.
     yearly["label_base_rate"] = custom_stats["base_rate"]
@@ -647,6 +700,7 @@ def run_top_n_study(
     for n in n_values:
         yearly[f"top{n}_return"] = by_n[n]
         yearly[f"top{n}_excess"] = by_n[n] - yearly["benchmark_return"]
+        yearly[f"top{n}_excess_ew"] = by_n[n] - yearly["ew_benchmark_return"]
 
         # concentration proxy
         topn_sum = stock_yearly.apply(lambda r: r.dropna().nlargest(min(n, r.dropna().shape[0])).clip(lower=0).sum(), axis=1)
@@ -655,6 +709,7 @@ def run_top_n_study(
     # Summaries across years
     summary_rows = []
     benchmark_cagr = compute_cagr(yearly["benchmark_return"])
+    ew_benchmark_cagr = compute_cagr(ew_yearly)
     custom_mean_cagr = compute_cagr(custom_stats["mean"]) if "mean" in custom_stats.columns else np.nan
     custom_q05_cagr = compute_cagr(custom_stats["q05"]) if "mean" in custom_stats.columns else np.nan
     custom_q95_cagr = compute_cagr(custom_stats["q95"]) if "mean" in custom_stats.columns else np.nan
@@ -665,16 +720,20 @@ def run_top_n_study(
         r = by_n[n]
         r2 = by_n_bottom[n]
         excess = r - yearly["benchmark_return"]
+        excess_ew = r - yearly["ew_benchmark_return"]
         summary_rows.append({
             "N": n,
             "years": int(r.notna().sum()),
             "avg_topN_return": float(r.mean()),
             "avg_benchmark_return": float(yearly["benchmark_return"].mean()),
+            "avg_ew_benchmark_return": float(yearly["ew_benchmark_return"].mean()),
             "avg_excess": float(excess.mean()),
+            "avg_excess_ew": float(excess_ew.mean()),
             "avg_bottomN_return": float(r2.mean()),
             "cagr_topN": compute_cagr(r),
             "cagr_bottomN": compute_cagr(r2),
             "cagr_benchmark": benchmark_cagr,
+            "cagr_ew_benchmark": ew_benchmark_cagr,
             "cagr_custom_mean": custom_mean_cagr,
             "cagr_custom_q05": custom_q05_cagr,
             "cagr_custom_q95": custom_q95_cagr,
@@ -733,8 +792,14 @@ def sweep_from_returns(
     labeling threshold) and ``precision_edge_mean`` (achieved precision minus
     base rate, averaged over years) — "precision p suffices" is only evidence
     of a strong model where that edge is large.
+
+    Each row compares q05 CAGR against two benchmarks: the cap-weighted
+    `bmk_yearly` (SPY) and the equal-weighted universe mean, which shares the
+    portfolios' weighting scheme — beating only the former may just be the
+    equal-weight effect, not selection skill.
     """
     cagr_benchmark = compute_cagr(bmk_yearly.reindex(stock_yearly.index))
+    cagr_ew_benchmark = compute_cagr(equal_weight_benchmark_returns(stock_yearly))
     rows = []
     for recall in recall_values:
         for precision in precision_values:
@@ -762,10 +827,16 @@ def sweep_from_returns(
                     ),
                     "cagr_custom_q05": cagr_custom_q05,
                     "cagr_benchmark": cagr_benchmark,
+                    "cagr_ew_benchmark": cagr_ew_benchmark,
                     "custom_q05_meets_benchmark": bool(
                         not pd.isna(cagr_custom_q05)
                         and not pd.isna(cagr_benchmark)
                         and cagr_custom_q05 >= cagr_benchmark
+                    ),
+                    "custom_q05_meets_ew_benchmark": bool(
+                        not pd.isna(cagr_custom_q05)
+                        and not pd.isna(cagr_ew_benchmark)
+                        and cagr_custom_q05 >= cagr_ew_benchmark
                     ),
                 }
             )
@@ -862,10 +933,17 @@ def screen_label_criteria(
     same mean but with real variance, and right-skewed positive returns put
     the typical draw below it — the risk analysis starts where this ends.
 
+    Excess is reported against both benchmarks: the cap-weighted `bmk_yearly`
+    (SPY) and the equal-weighted universe mean, which shares the perfect
+    portfolio's weighting scheme — beating only the former may just be the
+    equal-weight effect. `bmk`-relative criteria still threshold against the
+    cap-weighted benchmark; only the comparison gains the second baseline.
+
     `criteria` items are spec strings (see parse_criterion) or already-parsed
     (kind, value) tuples. Returns a long DataFrame, one row per
     (criterion, year): threshold, num_positive, base_rate,
-    positive_mean_return, benchmark_return, excess.
+    positive_mean_return, benchmark_return, ew_benchmark_return, excess,
+    excess_ew.
     """
     rows = []
     for spec in criteria:
@@ -878,6 +956,7 @@ def screen_label_criteria(
             returns = stock_yearly.loc[y].dropna()
             if returns.empty:
                 continue
+            ew_bmk = float(returns.mean())
             threshold = bmk + value if kind == "benchmark" else value
             positives = returns[returns > threshold]
             mean_pos = float(positives.mean()) if len(positives) else np.nan
@@ -890,7 +969,9 @@ def screen_label_criteria(
                     "base_rate": float(len(positives) / len(returns)),
                     "positive_mean_return": mean_pos,
                     "benchmark_return": float(bmk),
+                    "ew_benchmark_return": ew_bmk,
                     "excess": mean_pos - float(bmk),
+                    "excess_ew": mean_pos - ew_bmk,
                 }
             )
     return pd.DataFrame(rows)
@@ -900,6 +981,10 @@ def summarize_screen(screen_df: pd.DataFrame) -> pd.DataFrame:
     """
     Per-criterion verdict on the necessary condition: does the perfect
     (precision=1, recall=1) portfolio beat the benchmark across the period?
+    Verdicts come in pairs — ``passes_screen`` against the cap-weighted
+    benchmark and ``passes_screen_ew`` against the equal-weighted universe
+    mean; only the latter isolates selection value from the equal-weight
+    effect, since the perfect portfolio is itself equal-weighted.
 
     ``cagr_perfect`` compounds only years with a non-empty positive set
     (compute_cagr drops NaN years, mirroring the study's current no-pick
@@ -910,6 +995,7 @@ def summarize_screen(screen_df: pd.DataFrame) -> pd.DataFrame:
         by_year = grp.set_index("year")
         cagr_perfect = compute_cagr(by_year["positive_mean_return"])
         cagr_benchmark = compute_cagr(by_year["benchmark_return"])
+        cagr_ew_benchmark = compute_cagr(by_year["ew_benchmark_return"])
         rows.append(
             {
                 "criterion": name,
@@ -919,14 +1005,23 @@ def summarize_screen(screen_df: pd.DataFrame) -> pd.DataFrame:
                 "base_rate_min": float(grp["base_rate"].min()),
                 "avg_positive_mean_return": float(grp["positive_mean_return"].mean()),
                 "avg_benchmark_return": float(grp["benchmark_return"].mean()),
+                "avg_ew_benchmark_return": float(grp["ew_benchmark_return"].mean()),
                 "avg_excess": float(grp["excess"].mean()),
+                "avg_excess_ew": float(grp["excess_ew"].mean()),
                 "years_beating_benchmark": int((grp["excess"] > 0).sum()),
+                "years_beating_ew_benchmark": int((grp["excess_ew"] > 0).sum()),
                 "cagr_perfect": cagr_perfect,
                 "cagr_benchmark": cagr_benchmark,
+                "cagr_ew_benchmark": cagr_ew_benchmark,
                 "passes_screen": bool(
                     not pd.isna(cagr_perfect)
                     and not pd.isna(cagr_benchmark)
                     and cagr_perfect > cagr_benchmark
+                ),
+                "passes_screen_ew": bool(
+                    not pd.isna(cagr_perfect)
+                    and not pd.isna(cagr_ew_benchmark)
+                    and cagr_perfect > cagr_ew_benchmark
                 ),
             }
         )
@@ -968,6 +1063,10 @@ def plot_results(res: StudyResult, n_values):
     # Benchmark
     spy = res.yearly["benchmark_return"].copy()
     plt.plot(spy.index, spy.values, linewidth=3, label="SPY", color="black")
+    if "ew_benchmark_return" in res.yearly.columns:
+        ew = res.yearly["ew_benchmark_return"]
+        plt.plot(ew.index, ew.values, linewidth=2.2, label="Equal-weight universe",
+                 color="#555555", linestyle="--")
 
     # Top-N
     for n in n_values:
@@ -1031,6 +1130,10 @@ def plot_investment_growth(res: StudyResult, n_values, initial_investment: float
 
     spy_growth = compute_growth_series(res.yearly["benchmark_return"], initial_investment)
     plt.plot(spy_growth.index, spy_growth.values, linewidth=3, label="SPY", color="black")
+    if "ew_benchmark_return" in res.yearly.columns:
+        ew_growth = compute_growth_series(res.yearly["ew_benchmark_return"], initial_investment)
+        plt.plot(ew_growth.index, ew_growth.values, linewidth=2.2,
+                 label="Equal-weight universe", color="#555555", linestyle="--")
 
     for n in n_values:
         if n in res.by_n.columns:
@@ -1060,6 +1163,9 @@ def plot_investment_growth(res: StudyResult, n_values, initial_investment: float
 def plot_sweep_heatmap(
     sweep_df: pd.DataFrame,
     output_path: str = "recall_precision_heatmap.png",
+    *,
+    benchmark_col: str = "cagr_benchmark",
+    benchmark_name: str = "benchmark",
 ) -> None:
     """
     Heatmap of the sweep grid: precision (rows) x recall (columns), colored by
@@ -1067,10 +1173,14 @@ def plot_sweep_heatmap(
     portfolio CAGR beats the benchmark, red cells fall short, the gray midpoint
     is dead even. Cells where the pair was infeasible (no reachable selection,
     so no q05) render in flat gray with "n/a".
+
+    `benchmark_col`/`benchmark_name` pick which benchmark CAGR column the
+    excess is measured against (cap-weighted `cagr_benchmark` by default,
+    `cagr_ew_benchmark` for the equal-weighted universe).
     """
     from matplotlib.colors import LinearSegmentedColormap
 
-    excess = sweep_df["cagr_custom_q05"] - sweep_df["cagr_benchmark"]
+    excess = sweep_df["cagr_custom_q05"] - sweep_df[benchmark_col]
     grid = (
         sweep_df.assign(excess=excess)
         .pivot(index="precision", columns="recall", values="excess")
@@ -1118,12 +1228,14 @@ def plot_sweep_heatmap(
     ax.set_yticklabels([f"{p:g}" for p in grid.index])
     ax.set_xlabel("Target recall")
     ax.set_ylabel("Target precision")
-    ax.set_title("Worst-case (q05) CAGR vs benchmark by (recall, precision)")
+    ax.set_title(f"Worst-case (q05) CAGR vs {benchmark_name} by (recall, precision)")
     ax.tick_params(length=0)
     for spine in ax.spines.values():
         spine.set_visible(False)
 
     cbar = fig.colorbar(mesh, ax=ax)
+    # Title already names the benchmark; a generic label keeps the long
+    # equal-weight name from colliding with it on small grids.
     cbar.set_label("q05 CAGR − benchmark CAGR")
     cbar.ax.yaxis.set_major_formatter(lambda v, _: f"{v:+.0%}")
     cbar.outline.set_visible(False)
@@ -1286,6 +1398,12 @@ def run_sweep_command(args: argparse.Namespace) -> None:
     )
     if not args.no_plots:
         plot_sweep_heatmap(df)
+        plot_sweep_heatmap(
+            df,
+            output_path="recall_precision_heatmap_ew.png",
+            benchmark_col="cagr_ew_benchmark",
+            benchmark_name="equal-weight universe",
+        )
 
 
 def run_screen_command(args: argparse.Namespace) -> None:
@@ -1303,10 +1421,13 @@ def run_screen_command(args: argparse.Namespace) -> None:
     print("\n=== Screen summary by criterion ===")
     print(summary.round(4).to_string())
     print(
-        "\npasses_screen: the perfect-classifier CAGR beats the benchmark CAGR. "
-        "This is a necessary condition only — low-recall draws spread around the "
-        "same yearly mean with real variance, and right-skewed positive returns "
-        "put the typical draw below it."
+        "\npasses_screen: the perfect-classifier CAGR beats the cap-weighted "
+        "benchmark CAGR; passes_screen_ew: it beats the equal-weighted universe "
+        "mean, which shares the portfolio's weighting scheme — passing only the "
+        "former may just be the equal-weight effect. Both are necessary "
+        "conditions only — low-recall draws spread around the same yearly mean "
+        "with real variance, and right-skewed positive returns put the typical "
+        "draw below it."
     )
 
 

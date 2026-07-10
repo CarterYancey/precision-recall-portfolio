@@ -51,6 +51,11 @@ assert res.custom_stats["achieved_recall"].notna().any()
 assert "base_rate" in res.custom_stats.columns
 assert res.custom_stats["base_rate"].between(0, 1).all()
 assert "label_base_rate" in res.yearly.columns
+assert "ew_benchmark_return" in res.yearly.columns
+assert res.yearly["ew_benchmark_return"].notna().all()
+assert "top2_excess_ew" in res.yearly.columns
+assert "avg_ew_benchmark_return" in res.summary.columns
+assert "cagr_ew_benchmark" in res.summary.columns
 
 df = sweep_recall_precision_pairs(
     [0.3], [0.5],
@@ -63,6 +68,8 @@ df = sweep_recall_precision_pairs(
 for col in df.columns:
     for v in df[col]:
         assert not isinstance(v, (set, pd.Series, list)), f"non-scalar in sweep[{col!r}]: {type(v)}"
+assert "cagr_ew_benchmark" in df.columns
+assert "custom_q05_meets_ew_benchmark" in df.columns
 
 out = pd.read_csv("Precision_Recall_Tradeoff.csv")
 print("\n=== Precision_Recall_Tradeoff.csv ===")

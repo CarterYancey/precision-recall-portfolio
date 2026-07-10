@@ -62,7 +62,8 @@ def test_screen_values() -> None:
 
     assert list(screen.columns) == [
         "criterion", "year", "threshold", "num_positive", "base_rate",
-        "positive_mean_return", "benchmark_return", "excess",
+        "positive_mean_return", "benchmark_return", "ew_benchmark_return",
+        "excess", "excess_ew",
     ]
     # 4 criteria x 2 years
     assert len(screen) == 8
@@ -72,18 +73,26 @@ def test_screen_values() -> None:
         assert len(matched) == 1
         return matched.iloc[0]
 
+    # Equal-weight benchmark: mean over that year's universe with data.
+    ew_2020 = (0.30 + 0.05 - 0.10 + 0.50) / 4
+    ew_2021 = (-0.20 - 0.05 + 0.15) / 3  # D is NaN in 2021
+
     # >0% in 2020: positives {A, B, D}, mean (0.30 + 0.05 + 0.50) / 3.
     r = row(">0%", 2020)
     assert r["num_positive"] == 3
     assert np.isclose(r["base_rate"], 3 / 4)
     assert np.isclose(r["positive_mean_return"], (0.30 + 0.05 + 0.50) / 3)
     assert np.isclose(r["excess"], (0.30 + 0.05 + 0.50) / 3 - 0.10)
+    assert np.isclose(r["ew_benchmark_return"], ew_2020)
+    assert np.isclose(r["excess_ew"], (0.30 + 0.05 + 0.50) / 3 - ew_2020)
 
     # >0% in 2021: D is NaN so the universe is {A, B, C}; only C is positive.
     r = row(">0%", 2021)
     assert r["num_positive"] == 1
     assert np.isclose(r["base_rate"], 1 / 3)
     assert np.isclose(r["positive_mean_return"], 0.15)
+    assert np.isclose(r["ew_benchmark_return"], ew_2021)
+    assert np.isclose(r["excess_ew"], 0.15 - ew_2021)
 
     # >10% in 2020: strictly greater, so B (0.05) is out and A, D are in.
     r = row(">10%", 2020)
@@ -113,12 +122,14 @@ def test_screen_empty_positive_set() -> None:
     assert (screen["base_rate"] == 0.0).all()
     assert screen["positive_mean_return"].isna().all()
     assert screen["excess"].isna().all()
+    assert screen["excess_ew"].isna().all()
 
     summary = summarize_screen(screen)
     r = summary.loc[">60%"]
     assert r["years_no_positive"] == 2
     assert pd.isna(r["cagr_perfect"])
     assert not r["passes_screen"]
+    assert not r["passes_screen_ew"]
 
 
 def test_summary_verdicts() -> None:
@@ -143,6 +154,21 @@ def test_summary_verdicts() -> None:
     assert np.isclose(
         summary.loc[">0%", "cagr_benchmark"],
         compute_cagr(bmk_yearly),
+    )
+
+    # Equal-weight verdicts: the >0% positive-set mean beats the universe
+    # mean both years by construction (it drops the negatives).
+    r = summary.loc[">0%"]
+    assert r["years_beating_ew_benchmark"] == 2
+    assert r["avg_excess_ew"] > 0
+    assert r["passes_screen_ew"]
+    assert np.isclose(
+        r["cagr_ew_benchmark"],
+        compute_cagr(per_year["ew_benchmark_return"]),
+    )
+    assert np.isclose(
+        r["avg_ew_benchmark_return"],
+        per_year["ew_benchmark_return"].mean(),
     )
 
 
