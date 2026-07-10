@@ -49,9 +49,12 @@ def test_sweep_grid_shape_and_flags() -> None:
     assert list(df.columns) == [
         "recall", "precision", "achieved_recall_mean", "achieved_precision_mean",
         "base_rate_mean", "base_rate_min", "base_rate_max", "precision_edge_mean",
+        "excluded_top_mean",
         "cagr_custom_q05", "cagr_benchmark", "cagr_ew_benchmark",
         "custom_q05_meets_benchmark", "custom_q05_meets_ew_benchmark",
     ]
+    # Exclusion mode off by default.
+    assert (df["excluded_top_mean"] == 0).all()
     # Full cross product, recall-major order (matches the CSV consumers expect).
     assert df[["recall", "precision"]].values.tolist() == [
         [r, p] for r in recalls for p in precisions

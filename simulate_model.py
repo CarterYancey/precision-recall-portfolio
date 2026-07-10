@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Iterable, List, Optional, Tuple
 import math
 import numpy as np
 import pandas as pd
@@ -33,6 +33,18 @@ def _validate_metric(x: float, name: str) -> None:
         raise ValueError(f"{name} must be in [0, 1], got {x}.")
 
 
+def _excluded_mask(
+    df: pd.DataFrame, name_col: str, exclude_names: Optional[Iterable[str]]
+) -> pd.Series:
+    """Boolean mask of rows whose name is barred from the draw pools."""
+    if exclude_names is None:
+        return pd.Series(False, index=df.index)
+    excluded = {str(n) for n in exclude_names}
+    if not excluded:
+        return pd.Series(False, index=df.index)
+    return df[name_col].astype(str).isin(excluded)
+
+
 def estimate_num_ways(
     df: pd.DataFrame,
     name_col: str,
@@ -41,6 +53,7 @@ def estimate_num_ways(
     precision: float,
     *,
     positive_label: str = "TRUE",
+    exclude_names: Optional[Iterable[str]] = None,
 ) -> int:
     """
     Estimate the number of distinct subsets of names that satisfy the requested (recall, precision),
@@ -62,14 +75,23 @@ def estimate_num_ways(
           * recall==0, precision==1 -> 1
           * recall==0, precision==0 -> 2^F - 1
           * recall==0, precision in (0,1) -> 0
+
+    `exclude_names` bars names from being drawn without changing the
+    confusion-matrix denominators: an excluded positive still counts toward T
+    (the TP quota round(recall * T) is unchanged) but is forced to be a false
+    negative. Counting then uses the pool sizes — ways = C(T_pool, TP) *
+    C(F_pool, FP) — and a quota exceeding its pool is infeasible (0 ways).
     """
     _validate_metric(recall, "recall")
     _validate_metric(precision, "precision")
 
     labels = df[label_col].astype(str)
     pos_mask = labels.eq(str(positive_label))
+    excluded = _excluded_mask(df, name_col, exclude_names)
     T = int(pos_mask.sum())
     F = int((~pos_mask).sum())
+    T_pool = int((pos_mask & ~excluded).sum())
+    F_pool = int((~pos_mask & ~excluded).sum())
 
     # No positives in dataset
     if T == 0:
@@ -78,28 +100,31 @@ def estimate_num_ways(
         if _is_close(precision, 1.0):
             return 1
         if _is_close(precision, 0.0):
-            return (1 << F) - 1  # 2^F - 1
+            return (1 << F_pool) - 1  # 2^F_pool - 1
         return 0
 
     tp = int(round(recall * T))
     tp = max(0, min(tp, T))
 
     if _is_close(precision, 0.0):
-        return 0 if tp > 0 else ((1 << F) - 1)  # any non-empty neg subset
+        return 0 if tp > 0 else ((1 << F_pool) - 1)  # any non-empty neg subset
 
     if _is_close(precision, 1.0) and tp == 0:
         return 1  # must select nothing
 
+    if tp > T_pool:
+        return 0
+
     # precision in (0,1] with tp>=0
     fp = int(round(tp * (1.0 - precision) / precision))
-    if fp < 0 or fp > F:
+    if fp < 0 or fp > F_pool:
         return 0
 
     # If tp==0, fp will be 0; that yields precision=1, so any request in (0,1) is infeasible
     if tp == 0 and not _is_close(precision, 1.0):
         return 0
 
-    return math.comb(T, tp) * math.comb(F, fp)
+    return math.comb(T_pool, tp) * math.comb(F_pool, fp)
 
 
 def simulate_selection(
@@ -112,6 +137,7 @@ def simulate_selection(
     positive_label: str = "TRUE",
     random_state: Optional[int] = None,
     strict: bool = False,
+    exclude_names: Optional[Iterable[str]] = None,
 ) -> SimulationResult:
     """
     Simulate a "model-selected" list of names from df that targets (recall, precision).
@@ -121,20 +147,31 @@ def simulate_selection(
       FP = round(TP * (1 - precision) / precision)  (when precision > 0)
       Select TP positives and FP negatives uniformly at random.
 
+    `exclude_names` bars names from being drawn while keeping them in the
+    metric denominators — the "miss the super-performers" mode: an excluded
+    positive is a forced false negative, so the TP quota round(recall * T)
+    must be filled from the remaining (ordinary) positives. When a quota
+    exceeds its shrunken pool the draw is capped with a note, like other
+    infeasible requests.
+
     If strict=True, raises ValueError on infeasible requests.
     Otherwise, returns best-effort with a note and reports achieved metrics.
     """
     _validate_metric(recall, "recall")
     _validate_metric(precision, "precision")
 
-    # Split positives/negatives
+    # Split positives/negatives; the draw pools additionally drop exclusions,
+    # while T/F (metric denominators) keep counting every row.
     labels = df[label_col].astype(str)
     pos_mask = labels.eq(str(positive_label))
-    pos_df = df.loc[pos_mask, [name_col]]
-    neg_df = df.loc[~pos_mask, [name_col]]
+    excluded = _excluded_mask(df, name_col, exclude_names)
+    pos_df = df.loc[pos_mask & ~excluded, [name_col]]
+    neg_df = df.loc[~pos_mask & ~excluded, [name_col]]
 
-    T = int(pos_df.shape[0])
-    F = int(neg_df.shape[0])
+    T = int(pos_mask.sum())
+    F = int((~pos_mask).sum())
+    T_pool = int(pos_df.shape[0])
+    F_pool = int(neg_df.shape[0])
 
     # Helper to compute achieved metrics safely
     def compute_metrics(tp_: int, fp_: int) -> Tuple[float, float]:
@@ -147,7 +184,8 @@ def simulate_selection(
 
     # Precompute "ways" for the exact request (0 if infeasible under rounding scheme)
     ways_requested = estimate_num_ways(
-        df, name_col, label_col, recall, precision, positive_label=positive_label
+        df, name_col, label_col, recall, precision,
+        positive_label=positive_label, exclude_names=exclude_names,
     )
 
     # If strict and infeasible, fail early.
@@ -178,14 +216,14 @@ def simulate_selection(
             )
 
         if _is_close(precision, 0.0):
-            if F == 0:
+            if F_pool == 0:
                 achieved_recall, achieved_precision = compute_metrics(tp_=0, fp_=0)
                 return SimulationResult(
                     recall, precision, achieved_recall, achieved_precision,
-                    tp=0, fp=0, fn=0, tn=0,
+                    tp=0, fp=0, fn=0, tn=F,
                     selected_names=[],
                     num_ways=0,
-                    note="Dataset is empty; cannot achieve precision=0.",
+                    note="No FALSE items available to select; cannot achieve precision=0.",
                 )
             # choose 1 negative (one valid outcome among many)
             selected = neg_df[name_col].sample(n=1, random_state=random_state).tolist()
@@ -194,7 +232,7 @@ def simulate_selection(
                 recall, precision, achieved_recall, achieved_precision,
                 tp=0, fp=1, fn=0, tn=F - 1,
                 selected_names=selected,
-                num_ways=(1 << F) - 1,
+                num_ways=(1 << F_pool) - 1,
                 note="No TRUE items; selected 1 FALSE item so precision is 0.0 by definition.",
             )
 
@@ -211,14 +249,20 @@ def simulate_selection(
     tp = int(round(recall * T))
     tp = max(0, min(tp, T))
 
+    if tp > T_pool:
+        note = (f"exclude_names bars {T - T_pool} of {T} TRUE items; TP quota {tp} exceeds "
+                f"the {T_pool} drawable positives. Capping TP to {T_pool} "
+                f"(achieved recall will be lower).")
+        tp = T_pool
+
     # Precision=0 special handling
     if _is_close(precision, 0.0):
         if tp > 0:
             note = "Requested precision=0 with recall>0 is impossible. Returning recall-matching selection with FP=0."
             fp = 0
         else:
-            fp = 1 if F > 0 else 0
-            if F == 0:
+            fp = 1 if F_pool > 0 else 0
+            if F_pool == 0:
                 note = "No FALSE items available; cannot achieve precision=0. Returning empty selection."
 
         selected_true = pos_df[name_col].sample(n=tp, random_state=random_state).tolist() if tp else []
@@ -226,7 +270,7 @@ def simulate_selection(
         selected = selected_true + selected_false
         achieved_recall, achieved_precision = compute_metrics(tp_=tp, fp_=fp)
 
-        num_ways = 0 if tp > 0 else ((1 << F) - 1 if F > 0 else 0)
+        num_ways = 0 if tp > 0 else ((1 << F_pool) - 1 if F_pool > 0 else 0)
         return SimulationResult(
             recall, precision, achieved_recall, achieved_precision,
             tp=tp, fp=fp, fn=T - tp, tn=F - fp,
@@ -239,10 +283,10 @@ def simulate_selection(
     fp = int(round(tp * (1.0 - precision) / precision))
     fp = max(0, fp)
 
-    if fp > F:
-        note = (f"Infeasible request: need FP={fp} but only F={F} FALSE exist. "
-                f"Capping FP to {F} (achieved precision will be higher).")
-        fp = F
+    if fp > F_pool:
+        note = (f"Infeasible request: need FP={fp} but only {F_pool} FALSE are drawable. "
+                f"Capping FP to {F_pool} (achieved precision will be higher).")
+        fp = F_pool
 
     if tp == 0 and not _is_close(precision, 1.0):
         note = ("With TP=0, achievable precision is 1.0 (select none) or 0.0 (select any). "
@@ -256,7 +300,7 @@ def simulate_selection(
     achieved_recall, achieved_precision = compute_metrics(tp_=tp, fp_=fp)
 
     # If we had to cap/adjust, the number of ways is for the *returned* (tp, fp).
-    num_ways_returned = math.comb(T, tp) * math.comb(F, fp) if (0 <= fp <= F) else 0
+    num_ways_returned = math.comb(T_pool, tp) * math.comb(F_pool, fp) if (0 <= fp <= F_pool) else 0
 
     return SimulationResult(
         recall, precision, achieved_recall, achieved_precision,

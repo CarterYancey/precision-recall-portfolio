@@ -142,6 +142,92 @@ def test_zero_positive_edge_cases() -> None:
     assert res.selected_names == [] and res.num_ways == 0
 
 
+def test_exclude_names() -> None:
+    df = build_df(10, 90)
+    excluded = ["p0", "p1"]
+    positives = {f"p{i}" for i in range(10)}
+
+    # T stays 10 (recall's denominator), so recall=0.5 still means TP=5 —
+    # but the 5 must come from the 8 non-excluded positives.
+    res = sim(df, 0.5, 0.5, random_state=1, exclude_names=excluded)
+    assert (res.tp, res.fp, res.fn, res.tn) == (5, 5, 5, 85), res
+    assert res.achieved_recall == 0.5 and res.achieved_precision == 0.5
+    assert res.note is None
+    assert not set(res.selected_names) & set(excluded)
+    assert len(set(res.selected_names) & positives) == 5
+    expected_ways = math.comb(8, 5) * math.comb(90, 5)
+    assert res.num_ways == expected_ways
+    assert estimate_num_ways(
+        df, "name", "label", 0.5, 0.5, exclude_names=excluded
+    ) == expected_ways
+
+    # Excluded names never show up, whatever the seed.
+    for seed in range(20):
+        res = sim(df, 0.5, 0.5, random_state=seed, exclude_names=excluded)
+        assert not set(res.selected_names) & set(excluded)
+
+    # TP quota exceeding the shrunken pool: recall=1 needs TP=10, only 8 drawable.
+    assert estimate_num_ways(df, "name", "label", 1.0, 1.0, exclude_names=excluded) == 0
+    res = sim(df, 1.0, 1.0, random_state=1, exclude_names=excluded)
+    assert res.tp == 8 and res.note is not None
+    assert res.achieved_recall == 0.8
+    assert set(res.selected_names) == positives - set(excluded)
+    assert res.num_ways == 1  # comb(8, 8) for the returned (capped) selection
+    try:
+        sim(df, 1.0, 1.0, strict=True, exclude_names=excluded)
+        raise AssertionError("strict=True should raise when the pool can't fill the quota")
+    except ValueError:
+        pass
+
+    # Excluded negatives shrink the FP pool the same way.
+    small = build_df(2, 3)
+    assert estimate_num_ways(
+        small, "name", "label", 1.0, 0.5, exclude_names=["n0", "n1"]
+    ) == 0
+    res = sim(small, 1.0, 0.5, random_state=1, exclude_names=["n0", "n1"])
+    assert res.fp == 1 and res.note is not None
+    assert "n0" not in res.selected_names and "n1" not in res.selected_names
+
+    # Names not in the dataset are ignored; empty exclusion is a no-op.
+    assert estimate_num_ways(
+        df, "name", "label", 0.5, 0.5, exclude_names=["ghost"]
+    ) == ways(df, 0.5, 0.5)
+    assert estimate_num_ways(
+        df, "name", "label", 0.5, 0.5, exclude_names=[]
+    ) == ways(df, 0.5, 0.5)
+
+
+def test_exclude_names_small_exhaustive() -> None:
+    # T=3, F=3, one positive excluded; brute-force subsets that avoid it and
+    # hit the (recall, precision) targets under the same rounding scheme.
+    df = build_df(3, 3)
+    from itertools import combinations
+
+    names = df["name"].tolist()
+    positives = set(names[:3])
+    excluded = {"p0"}
+
+    def brute(recall, precision) -> int:
+        tp_target = round(recall * 3)
+        count = 0
+        for r in range(len(names) + 1):
+            for combo in combinations(names, r):
+                if set(combo) & excluded:
+                    continue
+                tp = len(set(combo) & positives)
+                fp = len(combo) - tp
+                achieved_p = tp / (tp + fp) if combo else 1.0
+                if tp == tp_target and abs(achieved_p - precision) < 1e-9:
+                    count += 1
+        return count
+
+    for recall, precision in [(1.0, 1.0), (2 / 3, 1.0), (2 / 3, 0.5), (1 / 3, 0.5), (0.0, 1.0)]:
+        got = estimate_num_ways(
+            df, "name", "label", recall, precision, exclude_names=excluded
+        )
+        assert got == brute(recall, precision), (recall, precision, got)
+
+
 def test_num_ways_small_exhaustive() -> None:
     # T=2, F=3; brute-force every subset and compare counts with
     # estimate_num_ways under the same rounding scheme.
@@ -172,6 +258,8 @@ def main() -> None:
     test_rounding_scheme()
     test_infeasible_requests()
     test_zero_positive_edge_cases()
+    test_exclude_names()
+    test_exclude_names_small_exhaustive()
     test_num_ways_small_exhaustive()
     print("All simulate_model tests passed.")
 

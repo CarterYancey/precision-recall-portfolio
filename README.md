@@ -57,7 +57,9 @@ uv run python pickn.py study --n-values 10 50 100 --year-start 2000 --year-end 2
     --recall 0.3 --precision 0.8 --num-simulations 2000 --seed 42
 ```
 
-Other useful flags: `--benchmark` (default SPY), `--label-threshold` (label stocks against a fixed absolute return instead of the year's benchmark), `--initial-investment` (growth-plot starting value), and `--no-plots`. For programmatic use — e.g. supplying `tickers_by_year` to override per-year membership, or a fixed `tickers` list for a static universe — call `run_top_n_study` directly.
+Other useful flags: `--benchmark` (default SPY), `--label-threshold` (label stocks against a fixed absolute return instead of the year's benchmark), `--exclude-top` (see below), `--initial-investment` (growth-plot starting value), and `--no-plots`.
+
+**"Miss the super-performers" mode (`--exclude-top`).** Positive-class returns are heavily right-skewed: a few super-performers carry a large share of the positive-set mean, and a realistic model should not be credited with finding them. `--exclude-top` bars the best positives *by return* from the simulated model's picks — a value >= 1 is a count (top-K positives), a value in (0,1) a fraction of that year's positives (`0.1` = top decile). Excluded stocks still count toward recall's denominator (they become forced false negatives), so the TP quota is filled from ordinary criterion-meeting stocks only. The per-year excluded count appears as `excluded_top` in the yearly table (`excluded_top_mean` in the summary). Compare a run with the flag against one without it: the gap measures how much of the apparent edge depends on catching outliers nobody should count on catching. For programmatic use — e.g. supplying `tickers_by_year` to override per-year membership, or a fixed `tickers` list for a static universe — call `run_top_n_study` directly.
 
 ## Sweeping recall/precision pairs
 
@@ -67,7 +69,7 @@ The `sweep` subcommand evaluates a grid of (recall, precision) pairs, reporting 
 uv run python pickn.py sweep --recalls 0.1 0.2 0.3 --precisions 0.5 0.6 0.7 0.8 0.9
 ```
 
-The grid defaults to recalls `0.1 0.2 0.3` × precisions `0.5 0.6 0.7 0.8`, and the shared study flags (`--year-start`/`--year-end`, `--benchmark`, `--seed`, `--label-threshold`, `--num-simulations`) apply here too — see `uv run python pickn.py sweep --help`.
+The grid defaults to recalls `0.1 0.2 0.3` × precisions `0.5 0.6 0.7 0.8`, and the shared study flags (`--year-start`/`--year-end`, `--benchmark`, `--seed`, `--label-threshold`, `--exclude-top`, `--num-simulations`) apply here too — see `uv run python pickn.py sweep --help`. `--exclude-top` applies the "miss the super-performers" mode (see the study section) to every grid cell, with the average per-year excluded count reported as `excluded_top_mean`; sweeping the same grid with and without it shows how much of the feasible region depends on catching outliers.
 
 Each output row also carries the label base rate (`base_rate_mean/min/max` — prevalence `T/(T+F)`, identical across grid cells since it depends only on the labeling threshold) and `precision_edge_mean` (achieved precision minus base rate): "precision *p* suffices" is only evidence of a strong model where that edge is large, and with a fixed absolute `--label-threshold` the base rate collapses in bear years, which the per-year column in `custom_stats` makes visible.
 
