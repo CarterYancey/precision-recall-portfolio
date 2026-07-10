@@ -384,11 +384,16 @@ def simulate_custom_portfolio_distribution(
     that return >10%"), otherwise that year's `benchmark_return`. Performance of the
     resulting portfolios is always measured against the actual benchmark downstream;
     only the classification target changes.
+
+    The returned stats include ``base_rate``, the label prevalence T/(T+F) —
+    the precision a random picker gets for free that year, so achieved
+    precision is only evidence of skill to the extent it exceeds it.
     """
     if rng is None:
         rng = np.random.default_rng()
     threshold = benchmark_return if label_threshold is None else label_threshold
     labels = np.where(year_returns > threshold, positive_label, "FALSE")
+    base_rate = float((labels == positive_label).mean()) if labels.size else np.nan
     df = pd.DataFrame({"ticker": year_returns.index.astype(str), "label": labels})
 
     def draw_selection():
@@ -434,7 +439,8 @@ def simulate_custom_portfolio_distribution(
             "q95": np.nan,
             "count": 0,
             "achieved_recall": achieved_recall,
-            "achieved_precision": achieved_precision
+            "achieved_precision": achieved_precision,
+            "base_rate": base_rate,
         }
 
     return {
@@ -444,7 +450,8 @@ def simulate_custom_portfolio_distribution(
         "q95": float(np.quantile(returns_arr, 0.95)),
         "count": int(returns_arr.size),
         "achieved_recall": achieved_recall,
-        "achieved_precision": achieved_precision
+        "achieved_precision": achieved_precision,
+        "base_rate": base_rate,
     }
 
 
@@ -537,14 +544,20 @@ def compute_custom_stats(
 ) -> pd.DataFrame:
     """
     Per-year distribution stats for the simulated classifier's portfolios
-    (year x mean/std/q05/q95/count/achieved metrics). This is the only part of
-    the pipeline that depends on (recall, precision).
+    (year x mean/std/q05/q95/count/achieved metrics/base_rate). This is the
+    only part of the pipeline that depends on (recall, precision) — except
+    ``base_rate`` (label prevalence T/(T+F)), which depends only on the
+    labeling threshold and is reported so precision can be read as skill
+    over the dart-throwing baseline.
     """
     if rng is None:
         rng = np.random.default_rng()
     custom_stats = pd.DataFrame(
         index=stock_yearly.index,
-        columns=["mean", "std", "q05", "q95", "count", "achieved_recall", "achieved_precision"],
+        columns=[
+            "mean", "std", "q05", "q95", "count",
+            "achieved_recall", "achieved_precision", "base_rate",
+        ],
         dtype=float,
     )
     for y in stock_yearly.index:
@@ -623,6 +636,9 @@ def run_top_n_study(
     # Assemble metrics table
     yearly = pd.DataFrame(index=stock_yearly.index)
     yearly["benchmark_return"] = bmk_yearly.reindex(yearly.index)
+    # Label prevalence T/(T+F): the precision a dart-throwing picker gets for
+    # free that year, next to the results so precision reads as skill-over-chance.
+    yearly["label_base_rate"] = custom_stats["base_rate"]
 
     # Add excess returns and "top-N share of gains" diagnostics
     # Share-of-gains: sum of top-N stock returns / sum of all positive stock returns (simple proxy)
@@ -644,6 +660,7 @@ def run_top_n_study(
     custom_q95_cagr = compute_cagr(custom_stats["q95"]) if "mean" in custom_stats.columns else np.nan
     achieved_recall = custom_stats["achieved_recall"]
     achieved_precision = custom_stats["achieved_precision"]
+    base_rate = custom_stats["base_rate"]
     for n in n_values:
         r = by_n[n]
         r2 = by_n_bottom[n]
@@ -667,6 +684,11 @@ def run_top_n_study(
             "custom_precision_mean": float(achieved_precision.mean()),
             "custom_precision_min": float(achieved_precision.min()),
             "custom_precision_max": float(achieved_precision.max()),
+            "label_base_rate_mean": float(base_rate.mean()),
+            "label_base_rate_min": float(base_rate.min()),
+            "label_base_rate_max": float(base_rate.max()),
+            # Skill over chance: achieved precision minus the free baseline.
+            "custom_precision_edge_mean": float((achieved_precision - base_rate).mean()),
         })
     summary = pd.DataFrame(summary_rows).set_index("N")
 
@@ -705,6 +727,12 @@ def sweep_from_returns(
 
     Each cell reseeds its own RNG from `model_random_seed`, so a seeded sweep
     is reproducible cell-by-cell regardless of grid shape or order.
+
+    Rows carry the label base rate (prevalence T/(T+F), the precision a random
+    picker gets for free; identical across cells since it depends only on the
+    labeling threshold) and ``precision_edge_mean`` (achieved precision minus
+    base rate, averaged over years) — "precision p suffices" is only evidence
+    of a strong model where that edge is large.
     """
     cagr_benchmark = compute_cagr(bmk_yearly.reindex(stock_yearly.index))
     rows = []
@@ -726,6 +754,12 @@ def sweep_from_returns(
                     "precision": precision,
                     "achieved_recall_mean": float(custom_stats["achieved_recall"].mean()),
                     "achieved_precision_mean": float(custom_stats["achieved_precision"].mean()),
+                    "base_rate_mean": float(custom_stats["base_rate"].mean()),
+                    "base_rate_min": float(custom_stats["base_rate"].min()),
+                    "base_rate_max": float(custom_stats["base_rate"].max()),
+                    "precision_edge_mean": float(
+                        (custom_stats["achieved_precision"] - custom_stats["base_rate"]).mean()
+                    ),
                     "cagr_custom_q05": cagr_custom_q05,
                     "cagr_benchmark": cagr_benchmark,
                     "custom_q05_meets_benchmark": bool(
@@ -782,6 +816,151 @@ def sweep_recall_precision_pairs(
     if output_csv:
         df.to_csv(output_csv)
     return df
+
+
+DEFAULT_SCREEN_CRITERIA = ("0", "0.1", "bmk", "bmk+0.1")
+
+
+def parse_criterion(spec: str) -> Tuple[str, float]:
+    """
+    Parse a criterion spec into (kind, value).
+
+    A plain number is an absolute return threshold ("0", "0.1" for >10%);
+    "bmk" with an optional offset ("bmk+0.1", "bmk-0.05") is relative to each
+    year's benchmark return. Returns ("absolute", threshold) or
+    ("benchmark", offset).
+    """
+    text = spec.strip().lower()
+    if text.startswith("bmk"):
+        rest = text[len("bmk"):]
+        return "benchmark", float(rest) if rest else 0.0
+    return "absolute", float(text)
+
+
+def criterion_label(kind: str, value: float) -> str:
+    """Human-readable criterion name, e.g. '>10%' or '>benchmark+10%'."""
+    if kind == "benchmark":
+        return ">benchmark" if value == 0 else f">benchmark{value * 100:+g}%"
+    return f">{value * 100:g}%"
+
+
+def screen_label_criteria(
+    stock_yearly: pd.DataFrame,
+    bmk_yearly: pd.Series,
+    criteria: Iterable = DEFAULT_SCREEN_CRITERIA,
+) -> pd.DataFrame:
+    """
+    Perfect-precision necessary-condition screen for candidate labeling criteria.
+
+    For each criterion, the precision = 1.0 / recall = 1.0 portfolio is the
+    equal-weighted mean of every stock meeting the criterion that year — the
+    best any classifier trained on that criterion can average. If even this
+    portfolio fails to beat the benchmark, no precision level rescues the
+    criterion. One pass over precomputed returns; no selection simulation.
+
+    Passing is necessary, not sufficient: a low-recall draw centers on the
+    same mean but with real variance, and right-skewed positive returns put
+    the typical draw below it — the risk analysis starts where this ends.
+
+    `criteria` items are spec strings (see parse_criterion) or already-parsed
+    (kind, value) tuples. Returns a long DataFrame, one row per
+    (criterion, year): threshold, num_positive, base_rate,
+    positive_mean_return, benchmark_return, excess.
+    """
+    rows = []
+    for spec in criteria:
+        kind, value = parse_criterion(spec) if isinstance(spec, str) else spec
+        name = criterion_label(kind, value)
+        for y in stock_yearly.index:
+            bmk = bmk_yearly.get(y)
+            if pd.isna(bmk):
+                continue
+            returns = stock_yearly.loc[y].dropna()
+            if returns.empty:
+                continue
+            threshold = bmk + value if kind == "benchmark" else value
+            positives = returns[returns > threshold]
+            mean_pos = float(positives.mean()) if len(positives) else np.nan
+            rows.append(
+                {
+                    "criterion": name,
+                    "year": int(y),
+                    "threshold": float(threshold),
+                    "num_positive": int(len(positives)),
+                    "base_rate": float(len(positives) / len(returns)),
+                    "positive_mean_return": mean_pos,
+                    "benchmark_return": float(bmk),
+                    "excess": mean_pos - float(bmk),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def summarize_screen(screen_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Per-criterion verdict on the necessary condition: does the perfect
+    (precision=1, recall=1) portfolio beat the benchmark across the period?
+
+    ``cagr_perfect`` compounds only years with a non-empty positive set
+    (compute_cagr drops NaN years, mirroring the study's current no-pick
+    behavior), so ``years_no_positive`` is reported to keep that visible.
+    """
+    rows = []
+    for name, grp in screen_df.groupby("criterion", sort=False):
+        by_year = grp.set_index("year")
+        cagr_perfect = compute_cagr(by_year["positive_mean_return"])
+        cagr_benchmark = compute_cagr(by_year["benchmark_return"])
+        rows.append(
+            {
+                "criterion": name,
+                "years": int(len(grp)),
+                "years_no_positive": int((grp["num_positive"] == 0).sum()),
+                "base_rate_mean": float(grp["base_rate"].mean()),
+                "base_rate_min": float(grp["base_rate"].min()),
+                "avg_positive_mean_return": float(grp["positive_mean_return"].mean()),
+                "avg_benchmark_return": float(grp["benchmark_return"].mean()),
+                "avg_excess": float(grp["excess"].mean()),
+                "years_beating_benchmark": int((grp["excess"] > 0).sum()),
+                "cagr_perfect": cagr_perfect,
+                "cagr_benchmark": cagr_benchmark,
+                "passes_screen": bool(
+                    not pd.isna(cagr_perfect)
+                    and not pd.isna(cagr_benchmark)
+                    and cagr_perfect > cagr_benchmark
+                ),
+            }
+        )
+    return pd.DataFrame(rows).set_index("criterion")
+
+
+def screen_criteria_feasibility(
+    criteria: Iterable = DEFAULT_SCREEN_CRITERIA,
+    *,
+    year_start: int = 2000,
+    year_end: int = 2024,
+    benchmark: str = "SPY",
+    tickers: Optional[List[str]] = None,
+    tickers_by_year: Optional[Dict[int, List[str]]] = None,
+    output_csv: Optional[str] = "Criterion_Feasibility.csv",
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Download/prepare universe returns and run the perfect-precision screen.
+    Returns (per-year table, per-criterion summary); writes the per-year
+    table to `output_csv` unless None.
+    """
+    stock_yearly, bmk_yearly, _ = prepare_universe_returns(
+        year_start,
+        year_end,
+        benchmark=benchmark,
+        tickers=tickers,
+        tickers_by_year=tickers_by_year,
+    )
+    screen = screen_label_criteria(stock_yearly, bmk_yearly, criteria)
+    summary = summarize_screen(screen)
+    if output_csv:
+        screen.to_csv(output_csv, index=False)
+    return screen, summary
+
 
 def plot_results(res: StudyResult, n_values):
     plt.figure(figsize=(12, 7))
@@ -967,11 +1146,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--benchmark", default="SPY",
         help="Benchmark ticker (default: %(default)s).",
     )
-    common.add_argument(
+
+    model_common = argparse.ArgumentParser(add_help=False)
+    model_common.add_argument(
         "--seed", type=int, default=None,
         help="Random seed for the simulated classifier (default: nondeterministic).",
     )
-    common.add_argument(
+    model_common.add_argument(
         "--label-threshold", type=float, default=None,
         help="Absolute return the hypothetical classifier labels stocks against "
              "(e.g. 0.1 for '>10%% per year'). Omit to label against each year's "
@@ -980,13 +1161,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser = argparse.ArgumentParser(
         prog="pickn",
-        description="Top-N winners vs S&P 500 study and (recall, precision) sweep. "
-                    "Running with no subcommand is equivalent to 'study' with defaults.",
+        description="Top-N winners vs S&P 500 study, (recall, precision) sweep, and "
+                    "labeling-criterion feasibility screen. Running with no subcommand "
+                    "is equivalent to 'study' with defaults.",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
     study = sub.add_parser(
-        "study", parents=[common],
+        "study", parents=[common, model_common],
         help="Run the top-N study once for a single (recall, precision) pair and write plots.",
     )
     study.add_argument(
@@ -1015,7 +1197,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     sweep = sub.add_parser(
-        "sweep", parents=[common],
+        "sweep", parents=[common, model_common],
         help="Run the study over a grid of (recall, precision) pairs and report "
              "where custom q05 CAGR meets the benchmark.",
     )
@@ -1038,6 +1220,24 @@ def build_parser() -> argparse.ArgumentParser:
     sweep.add_argument(
         "--no-plots", action="store_true",
         help="Skip writing the heatmap PNG.",
+    )
+
+    screen = sub.add_parser(
+        "screen", parents=[common],
+        help="Feasibility screen: per-year return of the perfect (precision=1, "
+             "recall=1) portfolio for each candidate labeling criterion. A "
+             "criterion whose perfect portfolio can't beat the benchmark can't "
+             "be rescued by any precision level.",
+    )
+    screen.add_argument(
+        "--criteria", nargs="+", default=list(DEFAULT_SCREEN_CRITERIA), metavar="SPEC",
+        help="Criterion specs: a number for an absolute return threshold "
+             "(0, 0.1 for >10%%) or benchmark-relative 'bmk', 'bmk+0.1', "
+             "'bmk-0.05' (default: %(default)s).",
+    )
+    screen.add_argument(
+        "--output", default="Criterion_Feasibility.csv",
+        help="CSV path for the per-year screen table (default: %(default)s).",
     )
 
     return parser
@@ -1088,6 +1288,28 @@ def run_sweep_command(args: argparse.Namespace) -> None:
         plot_sweep_heatmap(df)
 
 
+def run_screen_command(args: argparse.Namespace) -> None:
+    screen, summary = screen_criteria_feasibility(
+        args.criteria,
+        year_start=args.year_start,
+        year_end=args.year_end,
+        benchmark=args.benchmark,
+        output_csv=args.output,
+    )
+    pd.set_option("display.width", 140)
+    pd.set_option("display.max_columns", 50)
+    print("\n=== Criterion feasibility screen (precision=1, recall=1 portfolio) ===")
+    print(screen.set_index(["criterion", "year"]).round(4).to_string())
+    print("\n=== Screen summary by criterion ===")
+    print(summary.round(4).to_string())
+    print(
+        "\npasses_screen: the perfect-classifier CAGR beats the benchmark CAGR. "
+        "This is a necessary condition only — low-recall draws spread around the "
+        "same yearly mean with real variance, and right-skewed positive returns "
+        "put the typical draw below it."
+    )
+
+
 def main(argv: Optional[List[str]] = None) -> None:
     if argv is None:
         argv = sys.argv[1:]
@@ -1096,6 +1318,8 @@ def main(argv: Optional[List[str]] = None) -> None:
     args = build_parser().parse_args(argv)
     if args.command == "sweep":
         run_sweep_command(args)
+    elif args.command == "screen":
+        run_screen_command(args)
     else:
         run_study_command(args)
 
