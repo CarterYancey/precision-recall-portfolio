@@ -412,6 +412,30 @@ def model_selected_portfolio_return(
     return portfolio_return(selected, weights)
 
 
+def resolve_top_exclusion_count(num_positives: int, exclude_top: Optional[float]) -> int:
+    """
+    Turn an ``exclude_top`` spec into a per-year count of top positives to bar
+    from the TP pool. ``None`` means the mode is off (0). A value in (0, 1) is
+    a fraction of that year's positives (0.1 = top decile; ceil, so any
+    nonzero fraction excludes at least one stock); a value >= 1 must be a
+    whole number and is an absolute count. Never more than ``num_positives``.
+    """
+    if exclude_top is None:
+        return 0
+    x = float(exclude_top)
+    if not np.isfinite(x) or x <= 0:
+        raise ValueError(f"exclude_top must be positive, got {exclude_top}.")
+    if x < 1.0:
+        if num_positives == 0:
+            return 0
+        return min(num_positives, int(math.ceil(x * num_positives)))
+    if not x.is_integer():
+        raise ValueError(
+            f"exclude_top >= 1 is an absolute count and must be whole, got {exclude_top}."
+        )
+    return min(num_positives, int(x))
+
+
 def simulate_custom_portfolio_distribution(
     year_returns: pd.Series,
     benchmark_return: float,
@@ -420,6 +444,7 @@ def simulate_custom_portfolio_distribution(
     num_simulations: int,
     *,
     label_threshold: Optional[float] = None,
+    exclude_top: Optional[float] = None,
     positive_label: str = "TRUE",
     rng: Optional[np.random.Generator] = None,
 ) -> Dict[str, float]:
@@ -433,9 +458,18 @@ def simulate_custom_portfolio_distribution(
     resulting portfolios is always measured against the actual benchmark downstream;
     only the classification target changes.
 
+    `exclude_top` is the "miss the super-performers" pessimism knob: bar the
+    top-k (value >= 1) or top fraction (value in (0, 1), e.g. 0.1 for the top
+    decile) of positives *by return* from the TP pool, so draws are built only
+    from ordinary criterion-meeting stocks. Excluded stocks still count toward
+    recall's denominator (they become forced false negatives) — the gap
+    against a run without exclusion measures how much of the apparent edge
+    depends on catching outliers no realistic model should be credited with.
+
     The returned stats include ``base_rate``, the label prevalence T/(T+F) —
     the precision a random picker gets for free that year, so achieved
-    precision is only evidence of skill to the extent it exceeds it.
+    precision is only evidence of skill to the extent it exceeds it — and
+    ``excluded_top``, the number of positives barred this year.
     """
     if rng is None:
         rng = np.random.default_rng()
@@ -443,6 +477,14 @@ def simulate_custom_portfolio_distribution(
     labels = np.where(year_returns > threshold, positive_label, "FALSE")
     base_rate = float((labels == positive_label).mean()) if labels.size else np.nan
     df = pd.DataFrame({"ticker": year_returns.index.astype(str), "label": labels})
+
+    positive_returns = year_returns[labels == positive_label]
+    num_excluded = resolve_top_exclusion_count(len(positive_returns), exclude_top)
+    excluded_names = (
+        positive_returns.nlargest(num_excluded).index.astype(str).tolist()
+        if num_excluded
+        else []
+    )
 
     def draw_selection():
         random_state = int(rng.integers(0, 2**31 - 1))
@@ -455,6 +497,7 @@ def simulate_custom_portfolio_distribution(
             positive_label=positive_label,
             random_state=random_state,
             strict=False,
+            exclude_names=excluded_names,
         )
 
     # Achieved metrics depend only on the label counts (draws only vary which
@@ -489,6 +532,7 @@ def simulate_custom_portfolio_distribution(
             "achieved_recall": achieved_recall,
             "achieved_precision": achieved_precision,
             "base_rate": base_rate,
+            "excluded_top": num_excluded,
         }
 
     return {
@@ -500,6 +544,7 @@ def simulate_custom_portfolio_distribution(
         "achieved_recall": achieved_recall,
         "achieved_precision": achieved_precision,
         "base_rate": base_rate,
+        "excluded_top": num_excluded,
     }
 
 
@@ -511,6 +556,9 @@ class StudyResult:
     custom_stats: pd.DataFrame    # year x custom distribution stats
     summary: pd.DataFrame         # N-level summary stats
     coverage: pd.DataFrame        # year x universe coverage / survivorship stats
+    # Uniform-draw baseline computed alongside custom_stats when exclude_top
+    # is on (same seed, so the two differ only by the exclusion); None otherwise.
+    custom_stats_uniform: Optional[pd.DataFrame] = None
 
 
 def prepare_universe_returns(
@@ -588,15 +636,19 @@ def compute_custom_stats(
     num_simulations: int,
     *,
     label_threshold: Optional[float] = None,
+    exclude_top: Optional[float] = None,
     rng: Optional[np.random.Generator] = None,
 ) -> pd.DataFrame:
     """
     Per-year distribution stats for the simulated classifier's portfolios
-    (year x mean/std/q05/q95/count/achieved metrics/base_rate). This is the
-    only part of the pipeline that depends on (recall, precision) — except
-    ``base_rate`` (label prevalence T/(T+F)), which depends only on the
-    labeling threshold and is reported so precision can be read as skill
-    over the dart-throwing baseline.
+    (year x mean/std/q05/q95/count/achieved metrics/base_rate/excluded_top).
+    This is the only part of the pipeline that depends on (recall, precision)
+    — except ``base_rate`` (label prevalence T/(T+F)), which depends only on
+    the labeling threshold and is reported so precision can be read as skill
+    over the dart-throwing baseline, and ``excluded_top`` (positives barred
+    from the TP pool by `exclude_top` — see
+    simulate_custom_portfolio_distribution), which depends only on the
+    labeling and the exclusion spec.
     """
     if rng is None:
         rng = np.random.default_rng()
@@ -604,7 +656,7 @@ def compute_custom_stats(
         index=stock_yearly.index,
         columns=[
             "mean", "std", "q05", "q95", "count",
-            "achieved_recall", "achieved_precision", "base_rate",
+            "achieved_recall", "achieved_precision", "base_rate", "excluded_top",
         ],
         dtype=float,
     )
@@ -619,6 +671,7 @@ def compute_custom_stats(
             precision,
             num_simulations,
             label_threshold=label_threshold,
+            exclude_top=exclude_top,
             rng=rng,
         )
         for key, value in stats.items():
@@ -638,6 +691,7 @@ def run_top_n_study(
     num_simulations: int = 1000,
     model_random_seed: Optional[int] = None,
     label_threshold: Optional[float] = None,
+    exclude_top: Optional[float] = None,
 ) -> StudyResult:
     """
     Main pipeline.
@@ -646,6 +700,15 @@ def run_top_n_study(
     stocks as exceeding: a fixed absolute value (e.g. 0.1 for ">10% per year"), or
     None to target beating that year's benchmark return. Portfolio performance is
     always compared against the actual benchmark either way.
+
+    `exclude_top` bars the top-k (>= 1) or top fraction (in (0, 1)) of each
+    year's positives by return from the simulated model's TP pool while they
+    still count toward recall — the "miss the super-performers" pessimism
+    knob; see simulate_custom_portfolio_distribution. When it is set, the
+    uniform-draw distribution is also computed in the same run (same seed, so
+    the two differ only by the exclusion) and returned as
+    ``custom_stats_uniform``, with ``*_uniform`` and ``avg_custom_mean_gap``
+    columns in the summary — the pessimism gap without needing a second run.
     """
     n_values = sorted(set(int(n) for n in n_values))
     print("model_recall: ", model_recall)
@@ -678,8 +741,22 @@ def run_top_n_study(
         model_precision,
         num_simulations,
         label_threshold=label_threshold,
+        exclude_top=exclude_top,
         rng=np.random.default_rng(model_random_seed),
     )
+    # Uniform-draw baseline for the pessimism gap, reseeded identically so
+    # the two distributions share draw luck and differ only by the exclusion.
+    custom_stats_uniform = None
+    if exclude_top is not None:
+        custom_stats_uniform = compute_custom_stats(
+            stock_yearly,
+            bmk_yearly,
+            model_recall,
+            model_precision,
+            num_simulations,
+            label_threshold=label_threshold,
+            rng=np.random.default_rng(model_random_seed),
+        )
 
     # Assemble metrics table
     yearly = pd.DataFrame(index=stock_yearly.index)
@@ -692,6 +769,8 @@ def run_top_n_study(
     # Label prevalence T/(T+F): the precision a dart-throwing picker gets for
     # free that year, next to the results so precision reads as skill-over-chance.
     yearly["label_base_rate"] = custom_stats["base_rate"]
+    # Positives barred from the TP pool by exclude_top (0 when the mode is off).
+    yearly["excluded_top"] = custom_stats["excluded_top"]
 
     # Add excess returns and "top-N share of gains" diagnostics
     # Share-of-gains: sum of top-N stock returns / sum of all positive stock returns (simple proxy)
@@ -748,6 +827,8 @@ def run_top_n_study(
             "label_base_rate_max": float(base_rate.max()),
             # Skill over chance: achieved precision minus the free baseline.
             "custom_precision_edge_mean": float((achieved_precision - base_rate).mean()),
+            # Positives barred from the TP pool per year (0 when exclude_top is off).
+            "excluded_top_mean": float(custom_stats["excluded_top"].mean()),
         })
     summary = pd.DataFrame(summary_rows).set_index("N")
 
@@ -757,6 +838,17 @@ def run_top_n_study(
         "avg_custom_q05_return": float(custom_stats["q05"].mean()),
         "avg_custom_q95_return": float(custom_stats["q95"].mean()),
     }
+    if custom_stats_uniform is not None:
+        # gap = uniform - excluded: the share of the simulated edge that came
+        # from catching the top positives.
+        mean_gap = custom_stats_uniform["mean"] - custom_stats["mean"]
+        custom_summary.update({
+            "cagr_custom_mean_uniform": compute_cagr(custom_stats_uniform["mean"]),
+            "cagr_custom_q05_uniform": compute_cagr(custom_stats_uniform["q05"]),
+            "cagr_custom_q95_uniform": compute_cagr(custom_stats_uniform["q95"]),
+            "avg_custom_mean_return_uniform": float(custom_stats_uniform["mean"].mean()),
+            "avg_custom_mean_gap": float(mean_gap.mean()),
+        })
     summary = summary.assign(**custom_summary)
 
     return StudyResult(
@@ -766,6 +858,7 @@ def run_top_n_study(
         custom_stats=custom_stats,
         summary=summary,
         coverage=coverage,
+        custom_stats_uniform=custom_stats_uniform,
     )
 
 
@@ -778,6 +871,7 @@ def sweep_from_returns(
     num_simulations: int = 5000,
     model_random_seed: Optional[int] = None,
     label_threshold: Optional[float] = None,
+    exclude_top: Optional[float] = None,
 ) -> pd.DataFrame:
     """
     Grid-evaluate (recall, precision) pairs on precomputed per-year returns.
@@ -797,6 +891,15 @@ def sweep_from_returns(
     `bmk_yearly` (SPY) and the equal-weighted universe mean, which shares the
     portfolios' weighting scheme — beating only the former may just be the
     equal-weight effect, not selection skill.
+
+    `exclude_top` applies the "miss the super-performers" mode to every cell
+    (see simulate_custom_portfolio_distribution); rows carry
+    ``excluded_top_mean``, the average number of positives barred per year.
+    Each cell then also runs the uniform draws with the same seed (so the two
+    differ only by the exclusion) and gains ``cagr_custom_q05_uniform``,
+    ``custom_q05_gap`` (uniform minus excluded) and the two
+    ``custom_q05_meets_*_uniform`` verdicts — the with/without comparison in
+    a single sweep.
     """
     cagr_benchmark = compute_cagr(bmk_yearly.reindex(stock_yearly.index))
     cagr_ew_benchmark = compute_cagr(equal_weight_benchmark_returns(stock_yearly))
@@ -810,11 +913,11 @@ def sweep_from_returns(
                 precision,
                 num_simulations,
                 label_threshold=label_threshold,
+                exclude_top=exclude_top,
                 rng=np.random.default_rng(model_random_seed),
             )
             cagr_custom_q05 = compute_cagr(custom_stats["q05"])
-            rows.append(
-                {
+            row = {
                     "recall": recall,
                     "precision": precision,
                     "achieved_recall_mean": float(custom_stats["achieved_recall"].mean()),
@@ -825,6 +928,7 @@ def sweep_from_returns(
                     "precision_edge_mean": float(
                         (custom_stats["achieved_precision"] - custom_stats["base_rate"]).mean()
                     ),
+                    "excluded_top_mean": float(custom_stats["excluded_top"].mean()),
                     "cagr_custom_q05": cagr_custom_q05,
                     "cagr_benchmark": cagr_benchmark,
                     "cagr_ew_benchmark": cagr_ew_benchmark,
@@ -839,7 +943,36 @@ def sweep_from_returns(
                         and cagr_custom_q05 >= cagr_ew_benchmark
                     ),
                 }
-            )
+            if exclude_top is not None:
+                # Uniform-draw baseline, reseeded identically so the cell's
+                # two distributions differ only by the exclusion.
+                uniform_stats = compute_custom_stats(
+                    stock_yearly,
+                    bmk_yearly,
+                    recall,
+                    precision,
+                    num_simulations,
+                    label_threshold=label_threshold,
+                    rng=np.random.default_rng(model_random_seed),
+                )
+                cagr_custom_q05_uniform = compute_cagr(uniform_stats["q05"])
+                row.update({
+                    "cagr_custom_q05_uniform": cagr_custom_q05_uniform,
+                    # gap = uniform - excluded: the q05-CAGR edge attributable
+                    # to catching the barred super-performers (NaN-propagating).
+                    "custom_q05_gap": cagr_custom_q05_uniform - cagr_custom_q05,
+                    "custom_q05_meets_benchmark_uniform": bool(
+                        not pd.isna(cagr_custom_q05_uniform)
+                        and not pd.isna(cagr_benchmark)
+                        and cagr_custom_q05_uniform >= cagr_benchmark
+                    ),
+                    "custom_q05_meets_ew_benchmark_uniform": bool(
+                        not pd.isna(cagr_custom_q05_uniform)
+                        and not pd.isna(cagr_ew_benchmark)
+                        and cagr_custom_q05_uniform >= cagr_ew_benchmark
+                    ),
+                })
+            rows.append(row)
     return pd.DataFrame(rows)
 
 
@@ -855,6 +988,7 @@ def sweep_recall_precision_pairs(
     num_simulations: int = 5000,
     model_random_seed: Optional[int] = None,
     label_threshold: Optional[float] = None,
+    exclude_top: Optional[float] = None,
     output_csv: Optional[str] = "Precision_Recall_Tradeoff.csv",
 ) -> pd.DataFrame:
     """
@@ -862,8 +996,8 @@ def sweep_recall_precision_pairs(
     meets or exceeds the benchmark CAGR. Prices and per-year universe returns are
     computed once and reused for every grid cell.
 
-    See run_top_n_study for the meaning of `label_threshold`. Pass
-    `output_csv=None` to skip writing the results to disk.
+    See run_top_n_study for the meaning of `label_threshold` and `exclude_top`.
+    Pass `output_csv=None` to skip writing the results to disk.
     """
     stock_yearly, bmk_yearly, _ = prepare_universe_returns(
         year_start,
@@ -880,6 +1014,7 @@ def sweep_recall_precision_pairs(
         num_simulations=num_simulations,
         model_random_seed=model_random_seed,
         label_threshold=label_threshold,
+        exclude_top=exclude_top,
     ).round(4)
     pd.set_option("display.width", 140)
     pd.set_option("display.max_columns", 50)
@@ -1093,6 +1228,15 @@ def plot_results(res: StudyResult, n_values):
                 alpha=0.2,
                 label="Custom (5-95% range)",
             )
+    if res.custom_stats_uniform is not None and "mean" in res.custom_stats_uniform.columns:
+        plt.plot(
+            res.custom_stats_uniform.index,
+            res.custom_stats_uniform["mean"],
+            linewidth=1.8,
+            label="Custom (mean, uniform draws)",
+            color="#7a3db8",
+            linestyle=":",
+        )
 
     plt.axhline(0.0, linestyle="--", linewidth=1, alpha=0.6)
     plt.title("Top-N S&P 500 Stocks vs SPY (1-Year Calendar Returns)")
@@ -1148,6 +1292,18 @@ def plot_investment_growth(res: StudyResult, n_values, initial_investment: float
             linewidth=2.2,
             label="Custom (mean)",
             color="#7a3db8",
+        )
+    if res.custom_stats_uniform is not None and "mean" in res.custom_stats_uniform.columns:
+        uniform_growth = compute_growth_series(
+            res.custom_stats_uniform["mean"], initial_investment
+        )
+        plt.plot(
+            uniform_growth.index,
+            uniform_growth.values,
+            linewidth=1.8,
+            label="Custom (mean, uniform draws)",
+            color="#7a3db8",
+            linestyle=":",
         )
 
     plt.title(f"Value of a ${initial_investment:.0f} Investment Reinvested Each Year")
@@ -1270,6 +1426,18 @@ def build_parser() -> argparse.ArgumentParser:
              "(e.g. 0.1 for '>10%% per year'). Omit to label against each year's "
              "benchmark return. Performance is always compared to the benchmark.",
     )
+    model_common.add_argument(
+        "--exclude-top", type=float, default=None, metavar="K_OR_FRAC",
+        help="Pessimism knob ('miss the super-performers'): bar the best "
+             "positives by return from the simulated model's picks. A value "
+             ">= 1 is a count (top-K positives), a value in (0,1) a fraction "
+             "of that year's positives (0.1 = top decile). Excluded stocks "
+             "still count toward recall's denominator, so the TP quota is "
+             "filled from ordinary criterion-meeting stocks only. The same "
+             "run also reports the uniform-draw baseline (same seed, no "
+             "exclusion), so the gap — how much of the edge comes from "
+             "catching outliers — is available without a second run.",
+    )
 
     parser = argparse.ArgumentParser(
         prog="pickn",
@@ -1366,6 +1534,7 @@ def run_study_command(args: argparse.Namespace) -> None:
         num_simulations=args.num_simulations,
         model_random_seed=args.seed,
         label_threshold=args.label_threshold,
+        exclude_top=args.exclude_top,
     )
 
     pd.set_option("display.width", 140)
@@ -1376,6 +1545,24 @@ def run_study_command(args: argparse.Namespace) -> None:
 
     print("\n=== Sample yearly output (last 5 years) ===")
     print(res.yearly.tail(5).round(4))
+
+    if res.custom_stats_uniform is not None:
+        comparison = pd.DataFrame({
+            "excluded_top": res.custom_stats["excluded_top"],
+            "mean_excluded": res.custom_stats["mean"],
+            "mean_uniform": res.custom_stats_uniform["mean"],
+            "mean_gap": res.custom_stats_uniform["mean"] - res.custom_stats["mean"],
+            "q05_excluded": res.custom_stats["q05"],
+            "q05_uniform": res.custom_stats_uniform["q05"],
+        })
+        print("\n=== Super-performer exclusion vs uniform draws (per year) ===")
+        print(comparison.round(4))
+        print(
+            "gap = uniform - excluded: the share of the simulated edge that "
+            "comes from catching the top positives (same seed, so the two "
+            "runs differ only by the exclusion)."
+        )
+
     res.summary.to_csv('res_summary.csv', index=False)
     res.yearly.to_csv('res_yearly.csv', index=False)
 
@@ -1394,6 +1581,7 @@ def run_sweep_command(args: argparse.Namespace) -> None:
         num_simulations=args.num_simulations,
         model_random_seed=args.seed,
         label_threshold=args.label_threshold,
+        exclude_top=args.exclude_top,
         output_csv=args.output,
     )
     if not args.no_plots:
