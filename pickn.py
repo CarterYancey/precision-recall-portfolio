@@ -548,13 +548,34 @@ def simulate_custom_portfolio_distribution(
     }
 
 
+# Summary columns computed on every run but only printed with --verbose:
+# excess-return and custom-classifier precision/recall/dispersion diagnostics
+# that clutter the default read of "did this beat the benchmark".
+SUMMARY_VERBOSE_ONLY_COLUMNS = [
+    "avg_excess",
+    "avg_excess_ew",
+    "custom_recall_mean",
+    "custom_recall_min",
+    "custom_recall_max",
+    "custom_precision_mean",
+    "custom_precision_min",
+    "custom_precision_max",
+    "custom_precision_edge_mean",
+    "avg_custom_std_return",
+    "avg_custom_q05_return",
+    "avg_custom_q95_return",
+    "avg_custom_mean_return_uniform",
+    "avg_custom_mean_gap",
+]
+
+
 @dataclass
 class StudyResult:
     yearly: pd.DataFrame          # year x metrics
     by_n: pd.DataFrame            # year x N (portfolio returns)
     by_n_bottom: pd.DataFrame            # year x N (portfolio returns)
     custom_stats: pd.DataFrame    # year x custom distribution stats
-    summary: pd.DataFrame         # N-level summary stats
+    summary: pd.DataFrame         # single-row summary stats (see run_study_command for the default/verbose column split)
     coverage: pd.DataFrame        # year x universe coverage / survivorship stats
     # Uniform-draw baseline computed alongside custom_stats when exclude_top
     # is on (same seed, so the two differ only by the exclusion); None otherwise.
@@ -785,8 +806,9 @@ def run_top_n_study(
         topn_sum = stock_yearly.apply(lambda r: r.dropna().nlargest(min(n, r.dropna().shape[0])).clip(lower=0).sum(), axis=1)
         yearly[f"top{n}_share_of_positive_gains"] = np.where(pos_sum > 0, topn_sum / pos_sum, np.nan)
 
-    # Summaries across years
-    summary_rows = []
+    # Summary across years. One row (not one per N — top-N/bottom-N return
+    # diagnostics live in `yearly` and the plots; what they told us here is
+    # now covered by the excluded_top metrics instead).
     benchmark_cagr = compute_cagr(yearly["benchmark_return"])
     ew_benchmark_cagr = compute_cagr(ew_yearly)
     custom_mean_cagr = compute_cagr(custom_stats["mean"]) if "mean" in custom_stats.columns else np.nan
@@ -795,44 +817,32 @@ def run_top_n_study(
     achieved_recall = custom_stats["achieved_recall"]
     achieved_precision = custom_stats["achieved_precision"]
     base_rate = custom_stats["base_rate"]
-    for n in n_values:
-        r = by_n[n]
-        r2 = by_n_bottom[n]
-        excess = r - yearly["benchmark_return"]
-        excess_ew = r - yearly["ew_benchmark_return"]
-        summary_rows.append({
-            "N": n,
-            "years": int(r.notna().sum()),
-            "avg_topN_return": float(r.mean()),
-            "avg_benchmark_return": float(yearly["benchmark_return"].mean()),
-            "avg_ew_benchmark_return": float(yearly["ew_benchmark_return"].mean()),
-            "avg_excess": float(excess.mean()),
-            "avg_excess_ew": float(excess_ew.mean()),
-            "avg_bottomN_return": float(r2.mean()),
-            "cagr_topN": compute_cagr(r),
-            "cagr_bottomN": compute_cagr(r2),
-            "cagr_benchmark": benchmark_cagr,
-            "cagr_ew_benchmark": ew_benchmark_cagr,
-            "cagr_custom_mean": custom_mean_cagr,
-            "cagr_custom_q05": custom_q05_cagr,
-            "cagr_custom_q95": custom_q95_cagr,
-            "custom_recall_mean": float(achieved_recall.mean()),
-            "custom_recall_min": float(achieved_recall.min()),
-            "custom_recall_max": float(achieved_recall.max()),
-            "custom_precision_mean": float(achieved_precision.mean()),
-            "custom_precision_min": float(achieved_precision.min()),
-            "custom_precision_max": float(achieved_precision.max()),
-            "label_base_rate_mean": float(base_rate.mean()),
-            "label_base_rate_min": float(base_rate.min()),
-            "label_base_rate_max": float(base_rate.max()),
-            # Skill over chance: achieved precision minus the free baseline.
-            "custom_precision_edge_mean": float((achieved_precision - base_rate).mean()),
-            # Positives barred from the TP pool per year (0 when exclude_top is off).
-            "excluded_top_mean": float(custom_stats["excluded_top"].mean()),
-        })
-    summary = pd.DataFrame(summary_rows).set_index("N")
-
-    custom_summary = {
+    excess = custom_stats["mean"] - yearly["benchmark_return"]
+    excess_ew = custom_stats["mean"] - yearly["ew_benchmark_return"]
+    summary_row = {
+        "years": int(len(yearly)),
+        "avg_benchmark_return": float(yearly["benchmark_return"].mean()),
+        "avg_ew_benchmark_return": float(yearly["ew_benchmark_return"].mean()),
+        "avg_excess": float(excess.mean()),
+        "avg_excess_ew": float(excess_ew.mean()),
+        "cagr_benchmark": benchmark_cagr,
+        "cagr_ew_benchmark": ew_benchmark_cagr,
+        "cagr_custom_mean": custom_mean_cagr,
+        "cagr_custom_q05": custom_q05_cagr,
+        "cagr_custom_q95": custom_q95_cagr,
+        "custom_recall_mean": float(achieved_recall.mean()),
+        "custom_recall_min": float(achieved_recall.min()),
+        "custom_recall_max": float(achieved_recall.max()),
+        "custom_precision_mean": float(achieved_precision.mean()),
+        "custom_precision_min": float(achieved_precision.min()),
+        "custom_precision_max": float(achieved_precision.max()),
+        "label_base_rate_mean": float(base_rate.mean()),
+        "label_base_rate_min": float(base_rate.min()),
+        "label_base_rate_max": float(base_rate.max()),
+        # Skill over chance: achieved precision minus the free baseline.
+        "custom_precision_edge_mean": float((achieved_precision - base_rate).mean()),
+        # Positives barred from the TP pool per year (0 when exclude_top is off).
+        "excluded_top_mean": float(custom_stats["excluded_top"].mean()),
         "avg_custom_mean_return": float(custom_stats["mean"].mean()),
         "avg_custom_std_return": float(custom_stats["std"].mean()),
         "avg_custom_q05_return": float(custom_stats["q05"].mean()),
@@ -842,14 +852,14 @@ def run_top_n_study(
         # gap = uniform - excluded: the share of the simulated edge that came
         # from catching the top positives.
         mean_gap = custom_stats_uniform["mean"] - custom_stats["mean"]
-        custom_summary.update({
+        summary_row.update({
             "cagr_custom_mean_uniform": compute_cagr(custom_stats_uniform["mean"]),
             "cagr_custom_q05_uniform": compute_cagr(custom_stats_uniform["q05"]),
             "cagr_custom_q95_uniform": compute_cagr(custom_stats_uniform["q95"]),
             "avg_custom_mean_return_uniform": float(custom_stats_uniform["mean"].mean()),
             "avg_custom_mean_gap": float(mean_gap.mean()),
         })
-    summary = summary.assign(**custom_summary)
+    summary = pd.DataFrame([summary_row])
 
     return StudyResult(
         yearly=yearly,
@@ -1475,6 +1485,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-plots", action="store_true",
         help="Skip writing the PNG plots.",
     )
+    study.add_argument(
+        "--verbose", action="store_true",
+        help="Print the full summary, including custom-classifier precision/recall "
+             "diagnostics and excess-return breakdowns that are hidden by default.",
+    )
 
     sweep = sub.add_parser(
         "sweep", parents=[common, model_common],
@@ -1540,11 +1555,14 @@ def run_study_command(args: argparse.Namespace) -> None:
     pd.set_option("display.width", 140)
     pd.set_option("display.max_columns", 50)
 
-    print("\n=== N-level summary ===")
-    print(res.summary.round(4))
+    print("\n=== Yearly output ===")
+    print(res.yearly.round(4))
 
-    print("\n=== Sample yearly output (last 5 years) ===")
-    print(res.yearly.tail(5).round(4))
+    print("\n=== Summary ===")
+    summary_to_print = res.summary if args.verbose else res.summary.drop(
+        columns=[c for c in SUMMARY_VERBOSE_ONLY_COLUMNS if c in res.summary.columns]
+    )
+    print(summary_to_print.round(4).T.to_string(index=True))
 
     if res.custom_stats_uniform is not None:
         comparison = pd.DataFrame({
