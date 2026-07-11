@@ -1562,7 +1562,7 @@ def run_study_command(args: argparse.Namespace) -> None:
     summary_to_print = res.summary if args.verbose else res.summary.drop(
         columns=[c for c in SUMMARY_VERBOSE_ONLY_COLUMNS if c in res.summary.columns]
     )
-    print(summary_to_print.round(4).to_string(index=False))
+    print(summary_to_print.round(4).T.to_string(index=True))
 
     if res.custom_stats_uniform is not None:
         comparison = pd.DataFrame({
