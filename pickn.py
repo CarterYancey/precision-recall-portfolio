@@ -1,10 +1,22 @@
 """
-Top-N winners vs S&P 500 (1-year horizons, by calendar year)
+Top-N winners vs S&P 500 (calendar-year formation cohorts, configurable
+holding horizon)
 
 Notes / assumptions:
 - "Top-performing stocks for that year" is determined ex post (with hindsight).
 - Uses point-in-time historical S&P 500 membership by default
   (data/SP500_history.csv, membership as of each year's January 1).
+- Holding horizon (`horizon`, default 1 year): each cohort is formed at the
+  start of a formation year and holds for h calendar years; returns are
+  measured from the formation year's first trading day to the last trading
+  day of year formation+h-1. Membership is taken at formation time; nothing
+  is bought or sold between rebalances (buy-and-hold within the window).
+  Non-overlapping windows (default) step formation years by h — chaining
+  those window returns is a realizable rebalance-every-h-years path.
+  Overlapping windows (`overlapping=True`) form a cohort every year — more
+  samples, but adjacent windows share h-1 years so they are autocorrelated
+  and their compounded product is NOT a realizable single path; annualized
+  statistics remain meaningful as per-cohort summaries.
 - Prices come from Sharadar via the Nasdaq Data Link API (SHARADAR/SEP for
   equities, SHARADAR/SFP for fund benchmarks like SPY); see
   docs/sharadar_docs.md. The API key is read from ~/.nasdaq/data_link_apikey
@@ -238,26 +250,80 @@ def download_adj_close(
     return adj
 
 
-def year_endpoints(trading_index: pd.DatetimeIndex, year: int) -> Optional[Tuple[pd.Timestamp, pd.Timestamp]]:
+def validate_horizon(horizon: int) -> int:
+    """Holding horizons are whole years >= 1."""
+    if int(horizon) != horizon or int(horizon) < 1:
+        raise ValueError(f"horizon must be a whole number of years >= 1, got {horizon}.")
+    return int(horizon)
+
+
+def formation_years(
+    year_start: int, year_end: int, horizon: int = 1, overlapping: bool = False
+) -> List[int]:
     """
-    Get first and last trading day for a given calendar year from available data.
-    Returns None if year not covered.
+    Formation years whose h-year holding windows fit entirely inside
+    [year_start, year_end]: the last formation year is year_end - h + 1.
+
+    Non-overlapping (default) steps formation years by h — buy at formation,
+    hold h years, rebalance into the next cohort; chaining those window
+    returns is a realizable path. Overlapping steps by 1 (rolling yearly
+    cohorts) — more samples, but adjacent windows share h-1 years, so treat
+    the cohorts as autocorrelated samples, not a path.
     """
-    mask = trading_index.year == year
+    horizon = validate_horizon(horizon)
+    last = year_end - horizon + 1
+    if last < year_start:
+        raise ValueError(
+            f"No {horizon}-year window fits in {year_start}..{year_end}."
+        )
+    step = 1 if overlapping else horizon
+    return list(range(year_start, last + 1, step))
+
+
+def annualize_window_return(window_return: float, horizon: int) -> float:
+    """Per-annum rate equivalent to a total return over `horizon` years."""
+    growth = 1.0 + window_return
+    if growth <= 0:
+        return -1.0
+    return growth ** (1.0 / horizon) - 1.0
+
+
+def compound_annual_threshold(annual: float, horizon: int) -> float:
+    """
+    Total-return equivalent over `horizon` years of a per-annum threshold —
+    e.g. '>10% annual over 3 years' means a window return above 1.1^3 - 1.
+    """
+    return (1.0 + annual) ** horizon - 1.0
+
+
+def year_endpoints(
+    trading_index: pd.DatetimeIndex, year: int, horizon: int = 1
+) -> Optional[Tuple[pd.Timestamp, pd.Timestamp]]:
+    """
+    First and last trading day of the h-year window starting at calendar
+    `year` (i.e. years [year, year + horizon - 1]) from available data.
+    Returns None if no trading day falls inside the window.
+    """
+    mask = (trading_index.year >= year) & (trading_index.year < year + horizon)
     if not mask.any():
         return None
     idx = trading_index[mask]
     return idx[0], idx[-1]
 
 
-def compute_calendar_year_returns(adj: pd.DataFrame, years: Iterable[int]) -> pd.DataFrame:
+def compute_calendar_year_returns(
+    adj: pd.DataFrame, years: Iterable[int], horizon: int = 1
+) -> pd.DataFrame:
     """
-    For each year, compute total return from first trading day to last trading day.
-    Returns a DataFrame indexed by year with columns = tickers.
+    For each formation year, the total return from the window's first trading
+    day to its last (the window spans `horizon` calendar years; with the
+    default horizon=1 these are plain calendar-year returns).
+    Returns a DataFrame indexed by formation year with columns = tickers.
     """
+    horizon = validate_horizon(horizon)
     rets = {}
     for y in years:
-        endpoints = year_endpoints(adj.index, y)
+        endpoints = year_endpoints(adj.index, y, horizon)
         if endpoints is None:
             continue
         d0, d1 = endpoints
@@ -265,7 +331,7 @@ def compute_calendar_year_returns(adj: pd.DataFrame, years: Iterable[int]) -> pd
         p1 = adj.loc[d1]
         r = (p1 / p0) - 1.0
         rets[y] = r
-    out = pd.DataFrame(rets).T  # years x tickers
+    out = pd.DataFrame(rets).T  # formation years x tickers
     out.index.name = "year"
     return out
 
@@ -275,34 +341,43 @@ def year_universe_returns(
     year: int,
     tickers: List[str],
     *,
+    horizon: int = 1,
     max_start_lag: int = 10,
     max_end_lead: int = 10,
 ) -> Tuple[pd.Series, Dict[str, float]]:
     """
-    Calendar-year returns for a point-in-time universe, without silently
-    dropping mid-year delistings.
+    Holding-window returns for a point-in-time universe, without silently
+    dropping delistings inside the window. `year` is the formation year and
+    the window spans calendar years [year, year + horizon - 1]; membership
+    is whatever `tickers` says at formation time. The default horizon=1
+    gives plain calendar-year returns.
 
     For each ticker the return uses the first and last *available* prices
-    within the year, so a stock that stops trading in June (bankruptcy,
-    acquisition) stays in the universe with its return measured to its final
-    print instead of becoming NaN. Rules:
+    within the window, so a stock that stops trading partway through
+    (bankruptcy, acquisition — whether in the formation year or a later
+    year of a multi-year horizon) stays in the universe with its return
+    measured to its final print instead of becoming NaN. Rules:
 
-    - No price data in the year at all -> dropped, counted as ``no_data``.
+    - No price data in the window at all -> dropped, counted as ``no_data``.
       (Sharadar SEP covers delisted names, so this residual survivorship
       bias is now mostly years before SEP's history starts (~1998) or
       symbols absent from SEP.)
-    - First price more than `max_start_lag` trading days after the year's
+    - First price more than `max_start_lag` trading days after the window's
       first trading day -> excluded, counted as ``late_start``. The ticker
-      was a constituent at the year start, so data appearing only mid-year
-      usually means the symbol was reused by a different company later.
-    - Last price more than `max_end_lead` trading days before the year's
+      was a constituent at formation, so data appearing only later usually
+      means the symbol was reused by a different company.
+    - Last price more than `max_end_lead` trading days before the window's
       last trading day -> kept, counted as ``partial_year`` (delisted
-      mid-year, return measured to the last available price).
+      inside the window, return measured to the last available price).
     - Otherwise counted as ``full_year``.
+
+    (The ``partial_year``/``full_year`` key names predate multi-year
+    horizons and mean partial/full *window* coverage.)
 
     Returns (returns indexed by ticker, coverage stats dict).
     """
-    mask = adj.index.year == year
+    horizon = validate_horizon(horizon)
+    mask = (adj.index.year >= year) & (adj.index.year < year + horizon)
     stats = {
         "members": len(tickers),
         "no_data": 0,
@@ -674,22 +749,34 @@ def prepare_universe_returns(
     benchmark: str = "SPY",
     tickers: Optional[List[str]] = None,
     tickers_by_year: Optional[Dict[int, List[str]]] = None,
+    horizon: int = 1,
+    overlapping: bool = False,
 ) -> Tuple[pd.DataFrame, pd.Series, pd.DataFrame]:
     """
     Download prices once and compute the inputs every study/sweep run shares:
-    per-year universe returns (year x ticker), benchmark calendar-year returns,
-    and the coverage/survivorship report (also printed).
+    per-window universe returns (formation year x ticker), benchmark window
+    returns, and the coverage/survivorship report (also printed).
+
+    `horizon` is the holding horizon in years: each cohort is formed at the
+    start of a formation year (membership snapshot at formation, as always)
+    and held buy-and-hold through year formation+h-1, with delistings inside
+    the window kept at their last available price (see year_universe_returns).
+    Formation years come from `formation_years`: non-overlapping windows step
+    by h (default; chaining them is a realizable rebalance-every-h-years
+    path), `overlapping=True` forms a cohort every year (more samples,
+    autocorrelated). With the default horizon=1 the two modes coincide and
+    everything reduces to the original calendar-year study.
 
     None of this depends on the simulated classifier's (recall, precision), so
     a grid sweep calls it once and reuses the result for every cell.
     """
+    horizon = validate_horizon(horizon)
+    years = formation_years(year_start, year_end, horizon, overlapping)
     if tickers_by_year is None:
         if tickers is None:
             tickers_by_year = get_sp500_tickers_by_year()
         else:
-            tickers_by_year = {
-                y: tickers for y in range(year_start, year_end + 1)
-            }
+            tickers_by_year = {y: tickers for y in years}
 
     tickers_union = {
         ticker for tickers_for_year in tickers_by_year.values()
@@ -706,15 +793,15 @@ def prepare_universe_returns(
     adj_bmk = adj[[benchmark]].copy()
     adj_stk = adj.drop(columns=[benchmark], errors="ignore")
 
-    years = range(year_start, year_end + 1)
-
     stock_yearly_rows = {}
     coverage_rows = {}
     for y in years:
         tickers_for_year = tickers_by_year.get(y)
         if not tickers_for_year:
             continue
-        year_rets, cov = year_universe_returns(adj_stk, y, tickers_for_year)
+        year_rets, cov = year_universe_returns(
+            adj_stk, y, tickers_for_year, horizon=horizon
+        )
         if year_rets.empty:
             continue
         stock_yearly_rows[y] = year_rets
@@ -723,16 +810,21 @@ def prepare_universe_returns(
     stock_yearly.index.name = "year"
     coverage = pd.DataFrame(coverage_rows).T
     coverage.index.name = "year"
-    print("\n=== Universe coverage / survivorship report ===")
+    window_desc = (
+        "1-year windows" if horizon == 1 else
+        f"{horizon}-year {'overlapping' if overlapping else 'non-overlapping'} "
+        f"windows, indexed by formation year"
+    )
+    print(f"\n=== Universe coverage / survivorship report ({window_desc}) ===")
     print(coverage.to_string(float_format=lambda v: f"{v:.3f}"))
     print(
         "no_data tickers were index members but have no Sharadar SEP history "
         "for the period (mostly pre-1998 years or unmapped symbols) and are "
         "excluded — results are upward-biased in proportion to these counts. "
-        "partial_year tickers stopped trading mid-year and are included at "
-        "their last available price."
+        "partial_year tickers stopped trading before the window's end and are "
+        "included at their last available price."
     )
-    bmk_yearly = compute_calendar_year_returns(adj_bmk, years)[benchmark]
+    bmk_yearly = compute_calendar_year_returns(adj_bmk, years, horizon=horizon)[benchmark]
     if bmk_yearly.isna().all():
         raise ValueError(
             f"No price data for benchmark {benchmark!r} in {year_start}..{year_end}. "
@@ -751,19 +843,31 @@ def compute_custom_stats(
     *,
     label_threshold: Optional[float] = None,
     exclude_top: Optional[float] = None,
+    horizon: int = 1,
     rng: Optional[np.random.Generator] = None,
 ) -> pd.DataFrame:
     """
-    Per-year distribution stats for the simulated classifier's portfolios
-    (year x mean/std/q05/q95/count/achieved metrics/base_rate/excluded_top).
-    This is the only part of the pipeline that depends on (recall, precision)
-    — except ``base_rate`` (label prevalence T/(T+F)), which depends only on
-    the labeling threshold and is reported so precision can be read as skill
-    over the dart-throwing baseline, and ``excluded_top`` (positives barred
-    from the TP pool by `exclude_top` — see
-    simulate_custom_portfolio_distribution), which depends only on the
+    Per-window distribution stats for the simulated classifier's portfolios
+    (formation year x mean/std/q05/q95/count/achieved metrics/base_rate/
+    excluded_top). This is the only part of the pipeline that depends on
+    (recall, precision) — except ``base_rate`` (label prevalence T/(T+F)),
+    which depends only on the labeling threshold and is reported so precision
+    can be read as skill over the dart-throwing baseline, and
+    ``excluded_top`` (positives barred from the TP pool by `exclude_top` —
+    see simulate_custom_portfolio_distribution), which depends only on the
     labeling and the exclusion spec.
+
+    `label_threshold` stays a *per-annum* rate; with a multi-year `horizon`
+    it is compounded to the window-total equivalent before labeling, so
+    e.g. threshold 0.0 over 3 years means '>0% annual over the next 3
+    years'. Benchmark-relative labeling (threshold None) compares window
+    return against the benchmark's window return, which needs no conversion.
+    `stock_yearly`/`bmk_yearly` must already hold matching h-year window
+    returns (see prepare_universe_returns).
     """
+    horizon = validate_horizon(horizon)
+    if label_threshold is not None:
+        label_threshold = compound_annual_threshold(label_threshold, horizon)
     if rng is None:
         rng = np.random.default_rng()
     custom_stats = pd.DataFrame(
@@ -806,6 +910,8 @@ def run_top_n_study(
     model_random_seed: Optional[int] = None,
     label_threshold: Optional[float] = None,
     exclude_top: Optional[float] = None,
+    horizon: int = 1,
+    overlapping: bool = False,
 ) -> StudyResult:
     """
     Main pipeline.
@@ -814,6 +920,14 @@ def run_top_n_study(
     stocks as exceeding: a fixed absolute value (e.g. 0.1 for ">10% per year"), or
     None to target beating that year's benchmark return. Portfolio performance is
     always compared against the actual benchmark either way.
+
+    `horizon`/`overlapping` set the holding horizon in years and the window
+    scheme (see prepare_universe_returns): every per-"year" number in the
+    result becomes an h-year window return indexed by formation year,
+    `label_threshold` stays per-annum (compounded to the window internally),
+    and all CAGRs are annualized by the horizon. With overlapping windows
+    the CAGRs are geometric means of annualized cohort returns, not a
+    realizable path — see compute_cagr.
 
     `exclude_top` bars the top-k (>= 1) or top fraction (in (0, 1)) of each
     year's positives by return from the simulated model's TP pool while they
@@ -825,6 +939,7 @@ def run_top_n_study(
     columns in the summary — the pessimism gap without needing a second run.
     """
     n_values = sorted(set(int(n) for n in n_values))
+    horizon = validate_horizon(horizon)
     print("model_recall: ", model_recall)
     print("model_precision: ", model_precision)
     stock_yearly, bmk_yearly, coverage = prepare_universe_returns(
@@ -833,6 +948,8 @@ def run_top_n_study(
         benchmark=benchmark,
         tickers=tickers,
         tickers_by_year=tickers_by_year,
+        horizon=horizon,
+        overlapping=overlapping,
     )
 
     # Compute top-N returns per year
@@ -856,6 +973,7 @@ def run_top_n_study(
         num_simulations,
         label_threshold=label_threshold,
         exclude_top=exclude_top,
+        horizon=horizon,
         rng=np.random.default_rng(model_random_seed),
     )
     # Uniform-draw baseline for the pessimism gap, reseeded identically so
@@ -869,6 +987,7 @@ def run_top_n_study(
             model_precision,
             num_simulations,
             label_threshold=label_threshold,
+            horizon=horizon,
             rng=np.random.default_rng(model_random_seed),
         )
 
@@ -902,18 +1021,22 @@ def run_top_n_study(
     # Summary across years. One row (not one per N — top-N/bottom-N return
     # diagnostics live in `yearly` and the plots; what they told us here is
     # now covered by the excluded_top metrics instead).
-    benchmark_cagr = compute_cagr(yearly["benchmark_return"])
-    ew_benchmark_cagr = compute_cagr(ew_yearly)
-    custom_mean_cagr = compute_cagr(custom_stats["mean"]) if "mean" in custom_stats.columns else np.nan
-    custom_q05_cagr = compute_cagr(custom_stats["q05"]) if "mean" in custom_stats.columns else np.nan
-    custom_q95_cagr = compute_cagr(custom_stats["q95"]) if "mean" in custom_stats.columns else np.nan
+    benchmark_cagr = compute_cagr(yearly["benchmark_return"], years_per_period=horizon)
+    ew_benchmark_cagr = compute_cagr(ew_yearly, years_per_period=horizon)
+    custom_mean_cagr = compute_cagr(custom_stats["mean"], years_per_period=horizon) if "mean" in custom_stats.columns else np.nan
+    custom_q05_cagr = compute_cagr(custom_stats["q05"], years_per_period=horizon) if "mean" in custom_stats.columns else np.nan
+    custom_q95_cagr = compute_cagr(custom_stats["q95"], years_per_period=horizon) if "mean" in custom_stats.columns else np.nan
     achieved_recall = custom_stats["achieved_recall"]
     achieved_precision = custom_stats["achieved_precision"]
     base_rate = custom_stats["base_rate"]
     excess = custom_stats["mean"] - yearly["benchmark_return"]
     excess_ew = custom_stats["mean"] - yearly["ew_benchmark_return"]
     summary_row = {
+        # Number of formation cohorts (h-year windows); equals calendar years
+        # only at horizon=1.
         "years": int(len(yearly)),
+        "horizon": int(horizon),
+        "overlapping_windows": bool(overlapping and horizon > 1),
         "avg_benchmark_return": float(yearly["benchmark_return"].mean()),
         "avg_ew_benchmark_return": float(yearly["ew_benchmark_return"].mean()),
         "avg_excess": float(excess.mean()),
@@ -946,9 +1069,9 @@ def run_top_n_study(
         # from catching the top positives.
         mean_gap = custom_stats_uniform["mean"] - custom_stats["mean"]
         summary_row.update({
-            "cagr_custom_mean_uniform": compute_cagr(custom_stats_uniform["mean"]),
-            "cagr_custom_q05_uniform": compute_cagr(custom_stats_uniform["q05"]),
-            "cagr_custom_q95_uniform": compute_cagr(custom_stats_uniform["q95"]),
+            "cagr_custom_mean_uniform": compute_cagr(custom_stats_uniform["mean"], years_per_period=horizon),
+            "cagr_custom_q05_uniform": compute_cagr(custom_stats_uniform["q05"], years_per_period=horizon),
+            "cagr_custom_q95_uniform": compute_cagr(custom_stats_uniform["q95"], years_per_period=horizon),
             "avg_custom_mean_return_uniform": float(custom_stats_uniform["mean"].mean()),
             "avg_custom_mean_gap": float(mean_gap.mean()),
         })
@@ -975,11 +1098,16 @@ def sweep_from_returns(
     model_random_seed: Optional[int] = None,
     label_threshold: Optional[float] = None,
     exclude_top: Optional[float] = None,
+    horizon: int = 1,
 ) -> pd.DataFrame:
     """
-    Grid-evaluate (recall, precision) pairs on precomputed per-year returns.
+    Grid-evaluate (recall, precision) pairs on precomputed per-window returns.
     Only the classifier simulation is repeated per cell; the price data,
     universe returns, and benchmark CAGR are shared across the whole grid.
+
+    `horizon` must match the window length of `stock_yearly`/`bmk_yearly`
+    (see prepare_universe_returns): it compounds the per-annum
+    `label_threshold` to the window total and annualizes every CAGR column.
 
     Each cell reseeds its own RNG from `model_random_seed`, so a seeded sweep
     is reproducible cell-by-cell regardless of grid shape or order.
@@ -1004,8 +1132,13 @@ def sweep_from_returns(
     ``custom_q05_meets_*_uniform`` verdicts — the with/without comparison in
     a single sweep.
     """
-    cagr_benchmark = compute_cagr(bmk_yearly.reindex(stock_yearly.index))
-    cagr_ew_benchmark = compute_cagr(equal_weight_benchmark_returns(stock_yearly))
+    horizon = validate_horizon(horizon)
+    cagr_benchmark = compute_cagr(
+        bmk_yearly.reindex(stock_yearly.index), years_per_period=horizon
+    )
+    cagr_ew_benchmark = compute_cagr(
+        equal_weight_benchmark_returns(stock_yearly), years_per_period=horizon
+    )
     rows = []
     for recall in recall_values:
         for precision in precision_values:
@@ -1017,9 +1150,10 @@ def sweep_from_returns(
                 num_simulations,
                 label_threshold=label_threshold,
                 exclude_top=exclude_top,
+                horizon=horizon,
                 rng=np.random.default_rng(model_random_seed),
             )
-            cagr_custom_q05 = compute_cagr(custom_stats["q05"])
+            cagr_custom_q05 = compute_cagr(custom_stats["q05"], years_per_period=horizon)
             row = {
                     "recall": recall,
                     "precision": precision,
@@ -1056,9 +1190,12 @@ def sweep_from_returns(
                     precision,
                     num_simulations,
                     label_threshold=label_threshold,
+                    horizon=horizon,
                     rng=np.random.default_rng(model_random_seed),
                 )
-                cagr_custom_q05_uniform = compute_cagr(uniform_stats["q05"])
+                cagr_custom_q05_uniform = compute_cagr(
+                    uniform_stats["q05"], years_per_period=horizon
+                )
                 row.update({
                     "cagr_custom_q05_uniform": cagr_custom_q05_uniform,
                     # gap = uniform - excluded: the q05-CAGR edge attributable
@@ -1092,15 +1229,18 @@ def sweep_recall_precision_pairs(
     model_random_seed: Optional[int] = None,
     label_threshold: Optional[float] = None,
     exclude_top: Optional[float] = None,
+    horizon: int = 1,
+    overlapping: bool = False,
     output_csv: Optional[str] = "Precision_Recall_Tradeoff.csv",
 ) -> pd.DataFrame:
     """
     Evaluate a grid of (recall, precision) pairs and report where custom q05 CAGR
-    meets or exceeds the benchmark CAGR. Prices and per-year universe returns are
+    meets or exceeds the benchmark CAGR. Prices and per-window universe returns are
     computed once and reused for every grid cell.
 
-    See run_top_n_study for the meaning of `label_threshold` and `exclude_top`.
-    Pass `output_csv=None` to skip writing the results to disk.
+    See run_top_n_study for the meaning of `label_threshold`, `exclude_top`,
+    and `horizon`/`overlapping`. Pass `output_csv=None` to skip writing the
+    results to disk.
     """
     stock_yearly, bmk_yearly, _ = prepare_universe_returns(
         year_start,
@@ -1108,6 +1248,8 @@ def sweep_recall_precision_pairs(
         benchmark=benchmark,
         tickers=tickers,
         tickers_by_year=tickers_by_year,
+        horizon=horizon,
+        overlapping=overlapping,
     )
     df = sweep_from_returns(
         stock_yearly,
@@ -1118,6 +1260,7 @@ def sweep_recall_precision_pairs(
         model_random_seed=model_random_seed,
         label_threshold=label_threshold,
         exclude_top=exclude_top,
+        horizon=horizon,
     ).round(4)
     pd.set_option("display.width", 140)
     pd.set_option("display.max_columns", 50)
@@ -1157,6 +1300,8 @@ def screen_label_criteria(
     stock_yearly: pd.DataFrame,
     bmk_yearly: pd.Series,
     criteria: Iterable = DEFAULT_SCREEN_CRITERIA,
+    *,
+    horizon: int = 1,
 ) -> pd.DataFrame:
     """
     Perfect-precision necessary-condition screen for candidate labeling criteria.
@@ -1178,11 +1323,19 @@ def screen_label_criteria(
     cap-weighted benchmark; only the comparison gains the second baseline.
 
     `criteria` items are spec strings (see parse_criterion) or already-parsed
-    (kind, value) tuples. Returns a long DataFrame, one row per
-    (criterion, year): threshold, num_positive, base_rate,
+    (kind, value) tuples, and their values are *per-annum* rates. With a
+    multi-year `horizon` (which must match the window length of
+    `stock_yearly`/`bmk_yearly`) each is compounded to the window-total
+    equivalent before thresholding — an absolute "0.1" means '>10% annual
+    over the window', and a "bmk+0.1" offset is added to the benchmark's
+    *annualized* window return before compounding back, so at horizon=1
+    everything reduces exactly to the old behavior. Returns a long
+    DataFrame, one row per (criterion, formation year): threshold (the
+    window-total value actually compared against), num_positive, base_rate,
     positive_mean_return, benchmark_return, ew_benchmark_return, excess,
     excess_ew.
     """
+    horizon = validate_horizon(horizon)
     rows = []
     for spec in criteria:
         kind, value = parse_criterion(spec) if isinstance(spec, str) else spec
@@ -1195,7 +1348,11 @@ def screen_label_criteria(
             if returns.empty:
                 continue
             ew_bmk = float(returns.mean())
-            threshold = bmk + value if kind == "benchmark" else value
+            if kind == "benchmark":
+                annual = annualize_window_return(bmk, horizon) + value
+            else:
+                annual = value
+            threshold = compound_annual_threshold(annual, horizon)
             positives = returns[returns > threshold]
             mean_pos = float(positives.mean()) if len(positives) else np.nan
             rows.append(
@@ -1215,7 +1372,7 @@ def screen_label_criteria(
     return pd.DataFrame(rows)
 
 
-def summarize_screen(screen_df: pd.DataFrame) -> pd.DataFrame:
+def summarize_screen(screen_df: pd.DataFrame, *, horizon: int = 1) -> pd.DataFrame:
     """
     Per-criterion verdict on the necessary condition: does the perfect
     (precision=1, recall=1) portfolio beat the benchmark across the period?
@@ -1224,16 +1381,21 @@ def summarize_screen(screen_df: pd.DataFrame) -> pd.DataFrame:
     mean; only the latter isolates selection value from the equal-weight
     effect, since the perfect portfolio is itself equal-weighted.
 
-    ``cagr_perfect`` compounds only years with a non-empty positive set
-    (compute_cagr drops NaN years, mirroring the study's current no-pick
+    `horizon` must match the window length the screen table was built with;
+    it annualizes the CAGR columns (see compute_cagr for the overlapping-
+    windows caveat).
+
+    ``cagr_perfect`` compounds only windows with a non-empty positive set
+    (compute_cagr drops NaN rows, mirroring the study's current no-pick
     behavior), so ``years_no_positive`` is reported to keep that visible.
     """
+    horizon = validate_horizon(horizon)
     rows = []
     for name, grp in screen_df.groupby("criterion", sort=False):
         by_year = grp.set_index("year")
-        cagr_perfect = compute_cagr(by_year["positive_mean_return"])
-        cagr_benchmark = compute_cagr(by_year["benchmark_return"])
-        cagr_ew_benchmark = compute_cagr(by_year["ew_benchmark_return"])
+        cagr_perfect = compute_cagr(by_year["positive_mean_return"], years_per_period=horizon)
+        cagr_benchmark = compute_cagr(by_year["benchmark_return"], years_per_period=horizon)
+        cagr_ew_benchmark = compute_cagr(by_year["ew_benchmark_return"], years_per_period=horizon)
         rows.append(
             {
                 "criterion": name,
@@ -1274,12 +1436,15 @@ def screen_criteria_feasibility(
     benchmark: str = "SPY",
     tickers: Optional[List[str]] = None,
     tickers_by_year: Optional[Dict[int, List[str]]] = None,
+    horizon: int = 1,
+    overlapping: bool = False,
     output_csv: Optional[str] = "Criterion_Feasibility.csv",
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     Download/prepare universe returns and run the perfect-precision screen.
-    Returns (per-year table, per-criterion summary); writes the per-year
-    table to `output_csv` unless None.
+    Returns (per-window table, per-criterion summary); writes the per-window
+    table to `output_csv` unless None. See run_top_n_study for
+    `horizon`/`overlapping`; criterion values stay per-annum rates.
     """
     stock_yearly, bmk_yearly, _ = prepare_universe_returns(
         year_start,
@@ -1287,15 +1452,17 @@ def screen_criteria_feasibility(
         benchmark=benchmark,
         tickers=tickers,
         tickers_by_year=tickers_by_year,
+        horizon=horizon,
+        overlapping=overlapping,
     )
-    screen = screen_label_criteria(stock_yearly, bmk_yearly, criteria)
-    summary = summarize_screen(screen)
+    screen = screen_label_criteria(stock_yearly, bmk_yearly, criteria, horizon=horizon)
+    summary = summarize_screen(screen, horizon=horizon)
     if output_csv:
         screen.to_csv(output_csv, index=False)
     return screen, summary
 
 
-def plot_results(res: StudyResult, n_values):
+def plot_results(res: StudyResult, n_values, horizon: int = 1):
     plt.figure(figsize=(12, 7))
 
     # Benchmark
@@ -1342,8 +1509,12 @@ def plot_results(res: StudyResult, n_values):
         )
 
     plt.axhline(0.0, linestyle="--", linewidth=1, alpha=0.6)
-    plt.title("Top-N S&P 500 Stocks vs SPY (1-Year Calendar Returns)")
-    plt.xlabel("Year")
+    if horizon == 1:
+        plt.title("Top-N S&P 500 Stocks vs SPY (1-Year Calendar Returns)")
+        plt.xlabel("Year")
+    else:
+        plt.title(f"Top-N S&P 500 Stocks vs SPY ({horizon}-Year Forward Window Returns)")
+        plt.xlabel("Formation year")
     plt.ylabel("Total Return")
     plt.legend()
     plt.grid(True, alpha=0.3)
@@ -1352,12 +1523,23 @@ def plot_results(res: StudyResult, n_values):
     plt.close()
 
 
-def compute_cagr(return_series: pd.Series) -> float:
+def compute_cagr(return_series: pd.Series, years_per_period: float = 1.0) -> float:
+    """
+    Annualized growth rate of a series of per-period total returns.
+
+    `years_per_period` is the calendar span of each observation — pass the
+    holding horizon h when the series holds h-year window returns. For
+    non-overlapping windows the result is the realizable CAGR of chaining
+    the windows; for overlapping windows the product double-counts shared
+    years, but the same formula still equals the geometric mean of the
+    annualized per-window returns, so it remains meaningful as a per-cohort
+    summary statistic (just not a path).
+    """
     series = return_series.dropna()
     if series.empty:
         return np.nan
     growth = (1.0 + series).prod()
-    years = series.shape[0]
+    years = series.shape[0] * years_per_period
     if years == 0 or growth <= 0:
         return np.nan
     return float(growth ** (1.0 / years) - 1.0)
@@ -1372,7 +1554,15 @@ def compute_growth_series(return_series: pd.Series, initial_investment: float = 
     return cumulative
 
 
-def plot_investment_growth(res: StudyResult, n_values, initial_investment: float = 100.0):
+def plot_investment_growth(
+    res: StudyResult, n_values, initial_investment: float = 100.0, horizon: int = 1
+):
+    """
+    Growth of an initial investment compounded across the study's windows.
+    Only meaningful for non-overlapping windows (chaining them is a
+    realizable path) — the study command skips this plot in overlapping
+    mode, where consecutive windows share calendar years.
+    """
     plt.figure(figsize=(12, 7))
 
     spy_growth = compute_growth_series(res.yearly["benchmark_return"], initial_investment)
@@ -1409,8 +1599,15 @@ def plot_investment_growth(res: StudyResult, n_values, initial_investment: float
             linestyle=":",
         )
 
-    plt.title(f"Value of a ${initial_investment:.0f} Investment Reinvested Each Year")
-    plt.xlabel("Year")
+    if horizon == 1:
+        plt.title(f"Value of a ${initial_investment:.0f} Investment Reinvested Each Year")
+        plt.xlabel("Year")
+    else:
+        plt.title(
+            f"Value of a ${initial_investment:.0f} Investment "
+            f"Reinvested Every {horizon} Years"
+        )
+        plt.xlabel("Formation year")
     plt.ylabel("Portfolio Value")
     plt.legend()
     plt.grid(True, alpha=0.3)
@@ -1517,6 +1714,24 @@ def build_parser() -> argparse.ArgumentParser:
         "--benchmark", default="SPY",
         help="Benchmark ticker (default: %(default)s).",
     )
+    common.add_argument(
+        "--horizon", type=int, default=1, metavar="H",
+        help="Holding horizon in years (default: %(default)s). Each cohort is "
+             "formed at the start of a formation year (membership snapshot at "
+             "formation) and held buy-and-hold through year formation+H-1; "
+             "delistings inside the window are kept at their last available "
+             "price. Labeling thresholds and screen criteria stay per-annum "
+             "rates (compounded over the window internally), and CAGRs are "
+             "annualized by the horizon.",
+    )
+    common.add_argument(
+        "--overlapping", action="store_true",
+        help="Form a cohort every year instead of every H years (rolling "
+             "windows). More sample windows, but consecutive windows share "
+             "H-1 calendar years, so they are autocorrelated and compounded "
+             "results are per-cohort summary statistics, not a realizable "
+             "path. No effect at --horizon 1.",
+    )
 
     model_common = argparse.ArgumentParser(add_help=False)
     model_common.add_argument(
@@ -1525,9 +1740,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     model_common.add_argument(
         "--label-threshold", type=float, default=None,
-        help="Absolute return the hypothetical classifier labels stocks against "
-             "(e.g. 0.1 for '>10%% per year'). Omit to label against each year's "
-             "benchmark return. Performance is always compared to the benchmark.",
+        help="Absolute per-annum return the hypothetical classifier labels stocks "
+             "against (e.g. 0.1 for '>10%% per year'; with --horizon H it is "
+             "compounded to the H-year window total, so 0.1 means '>10%% annual "
+             "over the window'). Omit to label against the benchmark's return "
+             "over the same window. Performance is always compared to the "
+             "benchmark.",
     )
     model_common.add_argument(
         "--exclude-top", type=float, default=None, metavar="K_OR_FRAC",
@@ -1621,7 +1839,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--criteria", nargs="+", default=list(DEFAULT_SCREEN_CRITERIA), metavar="SPEC",
         help="Criterion specs: a number for an absolute return threshold "
              "(0, 0.1 for >10%%) or benchmark-relative 'bmk', 'bmk+0.1', "
-             "'bmk-0.05' (default: %(default)s).",
+             "'bmk-0.05' (default: %(default)s). Values are per-annum rates; "
+             "with --horizon H they are compounded to the H-year window total "
+             "(offsets applied to the benchmark's annualized window return).",
     )
     screen.add_argument(
         "--output", default="Criterion_Feasibility.csv",
@@ -1643,6 +1863,8 @@ def run_study_command(args: argparse.Namespace) -> None:
         model_random_seed=args.seed,
         label_threshold=args.label_threshold,
         exclude_top=args.exclude_top,
+        horizon=args.horizon,
+        overlapping=args.overlapping,
     )
 
     pd.set_option("display.width", 140)
@@ -1678,8 +1900,18 @@ def run_study_command(args: argparse.Namespace) -> None:
     res.yearly.to_csv('res_yearly.csv', index=False)
 
     if not args.no_plots:
-        plot_results(res, args.n_values)
-        plot_investment_growth(res, args.n_values, initial_investment=args.initial_investment)
+        plot_results(res, args.n_values, horizon=args.horizon)
+        if args.overlapping and args.horizon > 1:
+            print(
+                "Skipping the growth plot: overlapping windows share calendar "
+                "years, so compounding them is not a realizable investment path."
+            )
+        else:
+            plot_investment_growth(
+                res, args.n_values,
+                initial_investment=args.initial_investment,
+                horizon=args.horizon,
+            )
 
 
 def run_sweep_command(args: argparse.Namespace) -> None:
@@ -1693,6 +1925,8 @@ def run_sweep_command(args: argparse.Namespace) -> None:
         model_random_seed=args.seed,
         label_threshold=args.label_threshold,
         exclude_top=args.exclude_top,
+        horizon=args.horizon,
+        overlapping=args.overlapping,
         output_csv=args.output,
     )
     if not args.no_plots:
@@ -1711,6 +1945,8 @@ def run_screen_command(args: argparse.Namespace) -> None:
         year_start=args.year_start,
         year_end=args.year_end,
         benchmark=args.benchmark,
+        horizon=args.horizon,
+        overlapping=args.overlapping,
         output_csv=args.output,
     )
     pd.set_option("display.width", 140)
