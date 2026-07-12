@@ -237,7 +237,8 @@ def test_uniform_baseline_in_study() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         os.chdir(tmp)
         try:
-            prices.to_csv("adj_close_cache.csv", index_label="Date")
+            os.makedirs("data/cache", exist_ok=True)
+            prices.to_csv("data/cache/adj_close_cache.csv", index_label="Date")
             res_uni = run_top_n_study(**common)
             res_excl = run_top_n_study(**common, exclude_top=0.1)
         finally:

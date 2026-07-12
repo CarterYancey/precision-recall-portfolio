@@ -4,26 +4,30 @@ Top-N winners vs S&P 500 (1-year horizons, by calendar year)
 Notes / assumptions:
 - "Top-performing stocks for that year" is determined ex post (with hindsight).
 - Uses point-in-time historical S&P 500 membership by default
-  (SP500_HistoricalComponents_withChanges.csv, first snapshot of each year).
+  (data/SP500_history.csv, membership as of each year's January 1).
+- Prices come from Sharadar via the Nasdaq Data Link API (SHARADAR/SEP for
+  equities, SHARADAR/SFP for fund benchmarks like SPY); see
+  docs/sharadar_docs.md. The API key is read from ~/.nasdaq/data_link_apikey
+  by the client automatically. Everything fetched is cached under data/cache/.
 - Survivorship bias handling (see year_universe_returns):
   * Tickers that stop trading mid-year (delistings/bankruptcies) are kept,
     with the return measured to their last available price, instead of being
     silently dropped for lacking a year-end price.
   * Tickers whose data only begins mid-year are excluded (guards against
     reused ticker symbols mapping to a different, later company).
-  * Tickers with no price data at all cannot be recovered from yfinance and
-    are dropped; per-year counts are reported in StudyResult.coverage so the
-    residual bias is visible. Because Yahoo lacks history for most delisted
-    names (e.g. Enron, Bear Stearns), dropped names skew toward the worst
-    outcomes and results remain upward-biased. A survivorship-bias-free
-    price source (CRSP, Sharadar, Norgate, ...) is the only full fix.
-- Uses adjusted close (includes splits + dividends where provider supports it).
+  * Tickers with no price data at all are dropped; per-year counts are
+    reported in StudyResult.coverage so the residual bias is visible.
+    Sharadar SEP includes delisted names (unlike Yahoo), so remaining
+    no_data drops are mostly years before SEP's history starts (~1998) or
+    symbols absent from SEP, not systematic blowup removal.
+- Uses Sharadar's closeadj (backward-adjusted for splits and dividends).
 - S&P 500 benchmark is proxied by SPY total return via adjusted close.
 """
 
 from __future__ import annotations
 
 import argparse
+import ast
 import math
 import sys
 from pathlib import Path
@@ -34,36 +38,42 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
-# pip install yfinance pandas numpy lxml
-import yfinance as yf
+# API key is read from ~/.nasdaq/data_link_apikey automatically.
+import nasdaqdatalink
 
 from simulate_model import SimulationResult, simulate_selection
 
-def get_sp500_tickers_from_csv(path="SP500Current.csv"):
-    df = pd.read_csv(path)
-    tickers = (
-        df["Symbol"]
-        .astype(str)
-        .str.strip()
-        .str.replace(".", "-", regex=False)
-        .tolist()
-    )
-    return sorted(set(tickers))
+SP500_HISTORY_CSV = "data/SP500_history.csv"
+DEFAULT_CACHE_PATH = "data/cache/adj_close_cache.csv"
+# Tickers per SHARADAR/SEP request. The client paginates 10,000 rows per page
+# with a 100-page cap, so a batch must stay under ~1M rows; 50 tickers over
+# 30 years of trading days is ~380K.
+SHARADAR_TICKER_BATCH = 50
 
 
-def get_sp500_tickers_by_year(path="SP500_HistoricalComponents_withChanges.csv") -> Dict[int, List[str]]:
+def get_sp500_tickers_by_year(path=SP500_HISTORY_CSV) -> Dict[int, List[str]]:
+    """
+    Point-in-time S&P 500 membership at the start of each calendar year.
+
+    The file has one row per membership *change* date, with the full ticker
+    list as a python list literal, so the snapshot in force on January 1 of
+    year Y is the last row dated on or before Y-01-01 (the year's first row
+    can be months into the year). Years before the first row get no entry.
+
+    Tickers are Sharadar-native symbols and are used verbatim: share classes
+    keep their dot (e.g. 'BRK.B'), and numeric suffixes ('ABI1') are
+    Sharadar's disambiguation of reused symbols.
+    """
     df = pd.read_csv(path)
     df["date"] = pd.to_datetime(df["date"])
-    df = df.sort_values("date")
-    first_by_year = df.groupby(df["date"].dt.year, as_index=False).first()
-    tickers_by_year = {}
-    for _, row in first_by_year.iterrows():
-        tickers = [
-            t.strip().replace(".", "-")
-            for t in str(row["tickers"]).split(",")
-            if t.strip()
-        ]
-        tickers_by_year[int(row["date"].year)] = tickers
+    df = df.sort_values("date").reset_index(drop=True)
+    tickers_by_year: Dict[int, List[str]] = {}
+    for year in range(int(df["date"].iloc[0].year), int(df["date"].iloc[-1].year) + 1):
+        snapshots = df[df["date"] <= pd.Timestamp(year=year, month=1, day=1)]
+        if snapshots.empty:
+            continue
+        tickers = ast.literal_eval(snapshots.iloc[-1]["tickers"])
+        tickers_by_year[year] = sorted({str(t).strip() for t in tickers})
     return tickers_by_year
 
 def cache_covers_dates(
@@ -96,62 +106,134 @@ def cache_covers_dates(
     )
 
 
+def _fetch_sharadar_closeadj_long(
+    table: str, tickers: List[str], start: str, end_inclusive: str
+) -> pd.DataFrame:
+    """
+    Long-form (ticker, date, closeadj) rows for `tickers` over
+    [start, end_inclusive] from one Sharadar price table, batched to stay
+    under the client's pagination cap. Tickers with no rows simply don't
+    appear in the output.
+    """
+    frames = []
+    for i in range(0, len(tickers), SHARADAR_TICKER_BATCH):
+        batch = list(tickers[i : i + SHARADAR_TICKER_BATCH])
+        raw = nasdaqdatalink.get_table(
+            table,
+            ticker=batch,
+            date={"gte": start, "lte": end_inclusive},
+            qopts={"columns": ["ticker", "date", "closeadj"]},
+            paginate=True,
+        )
+        if raw is not None and len(raw):
+            frames.append(raw)
+    if not frames:
+        return pd.DataFrame(columns=["ticker", "date", "closeadj"])
+    return pd.concat(frames, ignore_index=True)
+
+
+def fetch_adj_close(
+    tickers: List[str],
+    start: str,
+    end: str,
+    fund_tickers: Iterable[str] = (),
+) -> pd.DataFrame:
+    """
+    Fetch dividend+split adjusted closes (Sharadar `closeadj`) for
+    [start, end) — end exclusive, matching the cache slice convention — as a
+    wide date x ticker DataFrame.
+
+    Equities come from SHARADAR/SEP. Tickers listed in `fund_tickers` that
+    SEP returns nothing for are retried against SHARADAR/SFP (ETFs like the
+    SPY benchmark live there, not in SEP). Only declared fund tickers get the
+    SFP retry: a delisted stock's symbol can be reused by a fund, so blindly
+    falling back for every missing stock could splice in the wrong security.
+
+    Requested tickers with no data anywhere become all-NaN columns, so the
+    output always has exactly the requested columns (sorted) — downstream
+    coverage accounting and the cache's ticker check rely on that.
+    """
+    requested = sorted({str(t) for t in tickers})
+    end_inclusive = (pd.Timestamp(end) - pd.Timedelta(days=1)).date().isoformat()
+    long_df = _fetch_sharadar_closeadj_long("SHARADAR/SEP", requested, start, end_inclusive)
+    found = set(long_df["ticker"].astype(str)) if len(long_df) else set()
+    fund_retry = sorted({str(t) for t in fund_tickers} & (set(requested) - found))
+    if fund_retry:
+        fund_df = _fetch_sharadar_closeadj_long(
+            "SHARADAR/SFP", fund_retry, start, end_inclusive
+        )
+        long_df = pd.concat([long_df, fund_df], ignore_index=True)
+
+    if len(long_df):
+        long_df["date"] = pd.to_datetime(long_df["date"])
+        wide = long_df.pivot_table(
+            index="date", columns="ticker", values="closeadj", aggfunc="last"
+        )
+    else:
+        wide = pd.DataFrame(index=pd.DatetimeIndex([]))
+    wide = wide.reindex(columns=requested).sort_index()
+    wide.columns = [str(c) for c in wide.columns]
+    wide.index.name = "Date"
+    return wide
+
+
 def download_adj_close(
     tickers: List[str],
     start: str,
     end: str,
-    auto_adjust: bool = False,
-    cache_path: str = "adj_close_cache.csv",
+    cache_path: str = DEFAULT_CACHE_PATH,
+    fund_tickers: Iterable[str] = (),
 ) -> pd.DataFrame:
     """
-    Download daily prices and return Adjusted Close as wide dataframe.
-    yfinance returns 'Adj Close' if auto_adjust=False.
-    If auto_adjust=True, 'Close' is already adjusted; here we keep auto_adjust=False and use 'Adj Close'.
+    Cache-first adjusted-close loader: return a wide date x ticker frame for
+    [start, end), fetching from Sharadar (see fetch_adj_close) only what the
+    cache at `cache_path` can't serve.
+
+    - Cache covers the dates and the tickers: served entirely from cache.
+    - Cache covers the dates but lacks some tickers: only the missing tickers
+      are fetched (over the cache's own full date span, so the merged cache
+      stays valid for every request it already covered) and merged in.
+      All-NaN columns count as present — a ticker known to have no data is
+      not re-requested.
+    - Cache doesn't cover the dates: full re-download of the requested
+      tickers, overwriting the cache. No incremental date extension:
+      `closeadj` is backward-adjusted, so rows fetched at different times are
+      on different adjustment bases and must not be spliced per-ticker.
     """
+    requested = sorted({str(t) for t in tickers})
     cache_file = Path(cache_path)
     if cache_file.exists():
         cached = pd.read_csv(cache_file, index_col=0, parse_dates=True)
         cached.columns = [str(c) for c in cached.columns]
         cached = cached.sort_index()
-        requested = {str(t) for t in tickers}
-        has_all_tickers = requested.issubset(set(cached.columns))
+        missing = [t for t in requested if t not in set(cached.columns)]
         covers_dates = cache_covers_dates(cached.index, start, end)
-        if has_all_tickers and covers_dates:
-            print("Loading from cache file...")
-            # Match yfinance's convention: start inclusive, end exclusive.
+        if covers_dates:
+            if not missing:
+                print("Loading from cache file...")
+            else:
+                print(
+                    f"Cache lacks {len(missing)} of {len(requested)} requested "
+                    f"tickers; fetching only those from Sharadar."
+                )
+                fetch_start = cached.index.min().date().isoformat()
+                fetch_end = (cached.index.max() + pd.Timedelta(days=1)).date().isoformat()
+                new_cols = fetch_adj_close(
+                    missing, fetch_start, fetch_end, fund_tickers=fund_tickers
+                )
+                cached = cached.join(new_cols, how="outer").sort_index()
+                cache_file.parent.mkdir(parents=True, exist_ok=True)
+                cached.to_csv(cache_file, index_label="Date")
+            # Cache slice convention: start inclusive, end exclusive.
             in_range = (cached.index >= pd.Timestamp(start)) & (cached.index < pd.Timestamp(end))
-            return cached.loc[in_range, sorted(requested)]
-        if has_all_tickers and not covers_dates:
-            print(
-                f"Cache date range {cached.index.min().date()}..{cached.index.max().date()} "
-                f"does not cover requested {start}..{end}; re-downloading."
-            )
+            return cached.loc[in_range, requested]
+        print(
+            f"Cache date range {cached.index.min().date()}..{cached.index.max().date()} "
+            f"does not cover requested {start}..{end}; re-downloading."
+        )
 
-    data = yf.download(
-        tickers=tickers,
-        start=start,
-        end=end,
-        auto_adjust=auto_adjust,
-        progress=False,
-        group_by="column",
-        threads=True,
-    )
-
-    if isinstance(data.columns, pd.MultiIndex):
-        if "Adj Close" in data.columns.get_level_values(0):
-            adj = data["Adj Close"].copy()
-        elif "Close" in data.columns.get_level_values(0):
-            # fallback if provider didn't deliver adj close
-            adj = data["Close"].copy()
-        else:
-            raise ValueError("Could not find Adj Close/Close in downloaded data.")
-    else:
-        # single ticker
-        adj = data.rename(columns={"Adj Close": tickers[0], "Close": tickers[0]})
-
-    # Ensure column names are tickers
-    adj.columns = [str(c) for c in adj.columns]
-    adj = adj.sort_index()
+    adj = fetch_adj_close(requested, start, end, fund_tickers=fund_tickers)
+    cache_file.parent.mkdir(parents=True, exist_ok=True)
     adj.to_csv(cache_file, index_label="Date")
     return adj
 
@@ -206,7 +288,9 @@ def year_universe_returns(
     print instead of becoming NaN. Rules:
 
     - No price data in the year at all -> dropped, counted as ``no_data``.
-      (This is the residual survivorship bias yfinance forces on us.)
+      (Sharadar SEP covers delisted names, so this residual survivorship
+      bias is now mostly years before SEP's history starts (~1998) or
+      symbols absent from SEP.)
     - First price more than `max_start_lag` trading days after the year's
       first trading day -> excluded, counted as ``late_start``. The ticker
       was a constituent at the year start, so data appearing only mid-year
@@ -267,7 +351,7 @@ def simulate_year_model_selection(
     positive_label: str = "TRUE",
     random_state: Optional[int] = None,
     strict: bool = False,
-    cache_path: str = "adj_close_cache.csv",
+    cache_path: str = DEFAULT_CACHE_PATH,
 ) -> SimulationResult:
     """
     Build year-specific labels based on S&P 500 outperformance and run simulate_selection.
@@ -287,7 +371,9 @@ def simulate_year_model_selection(
     tickers_all = sorted(set(tickers_for_year + [benchmark]))
     start = f"{year}-01-01"
     end = f"{year + 1}-01-01"
-    adj = download_adj_close(tickers_all, start, end, cache_path=cache_path)
+    adj = download_adj_close(
+        tickers_all, start, end, cache_path=cache_path, fund_tickers=[benchmark]
+    )
     bmk_returns = compute_calendar_year_returns(adj[[benchmark]], [year])
     if bmk_returns.empty or year not in bmk_returns.index:
         raise ValueError(f"Could not compute returns for year {year}.")
@@ -334,10 +420,10 @@ def portfolio_return(returns: pd.Series, weights: Optional[pd.Series] = None) ->
     Equal weight when `weights` is None. Otherwise `weights` is a
     ticker-indexed series (e.g. point-in-time market caps for a cap-weighted
     portfolio); constituents without a positive weight are dropped and the
-    remaining weights renormalized. yfinance provides no historical share
-    counts, so nothing in the pipeline passes weights yet — the argument
-    exists so a survivorship-bias-free provider (Sharadar) can plug in
-    without touching the portfolio construction call sites.
+    remaining weights renormalized. Nothing in the pipeline passes weights
+    yet — the argument exists so point-in-time market caps (available from
+    Sharadar's DAILY/METRICS tables, not yet wired in) can plug in without
+    touching the portfolio construction call sites.
     """
     if weights is None:
         return float(returns.mean())
@@ -613,7 +699,7 @@ def prepare_universe_returns(
 
     start = f"{year_start}-01-01"
     end = f"{year_end}-12-31"
-    adj = download_adj_close(all_tickers, start=start, end=end, auto_adjust=False)
+    adj = download_adj_close(all_tickers, start=start, end=end, fund_tickers=[benchmark])
 
     if benchmark not in adj.columns:
         raise ValueError(f"Benchmark {benchmark} not in downloaded columns.")
@@ -640,12 +726,19 @@ def prepare_universe_returns(
     print("\n=== Universe coverage / survivorship report ===")
     print(coverage.to_string(float_format=lambda v: f"{v:.3f}"))
     print(
-        "no_data tickers were index members but have no yfinance history "
-        "(mostly delistings) and are excluded — results are upward-biased "
-        "in proportion to these counts. partial_year tickers stopped trading "
-        "mid-year and are included at their last available price."
+        "no_data tickers were index members but have no Sharadar SEP history "
+        "for the period (mostly pre-1998 years or unmapped symbols) and are "
+        "excluded — results are upward-biased in proportion to these counts. "
+        "partial_year tickers stopped trading mid-year and are included at "
+        "their last available price."
     )
     bmk_yearly = compute_calendar_year_returns(adj_bmk, years)[benchmark]
+    if bmk_yearly.isna().all():
+        raise ValueError(
+            f"No price data for benchmark {benchmark!r} in {year_start}..{year_end}. "
+            "ETF benchmarks come from SHARADAR/SFP — check that the subscription "
+            "includes it, or delete the cache if it was built without the benchmark."
+        )
     return stock_yearly, bmk_yearly, coverage
 
 

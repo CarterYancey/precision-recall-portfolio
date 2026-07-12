@@ -1,11 +1,15 @@
-"""Offline smoke test: fabricate an adj_close_cache.csv so download_adj_close
-never hits the network, then run run_top_n_study and sweep_recall_precision_pairs
-and check the summary/sweep cells are scalars (not embedded Series/sets)."""
+"""Offline smoke test: fabricate a price cache so download_adj_close never
+hits the network, then run run_top_n_study and sweep_recall_precision_pairs
+and check the summary/sweep cells are scalars (not embedded Series/sets).
+Runs inside a temp directory so no artifacts land in the repo."""
 import os
 import sys
+import tempfile
+from pathlib import Path
 
-sys.path.insert(0, "/home/user/precision-recall-portfolio")
-os.chdir(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+_tmpdir = tempfile.TemporaryDirectory()
+os.chdir(_tmpdir.name)
 
 import numpy as np
 import pandas as pd
@@ -19,7 +23,8 @@ prices = pd.DataFrame(
     index=dates,
     columns=all_cols,
 )
-prices.to_csv("adj_close_cache.csv", index_label="Date")
+os.makedirs("data/cache", exist_ok=True)
+prices.to_csv("data/cache/adj_close_cache.csv", index_label="Date")
 
 from pickn import run_top_n_study, sweep_recall_precision_pairs
 
