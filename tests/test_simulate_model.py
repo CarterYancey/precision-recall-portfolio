@@ -5,6 +5,7 @@ No network, no market data. Run with:
 """
 import math
 
+import numpy as np
 import pandas as pd
 
 import sys
@@ -12,7 +13,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from simulate_model import estimate_num_ways, simulate_selection
+from simulate_model import estimate_num_ways, sample_confusion_draws, simulate_selection
 
 
 def build_df(n_true: int, n_false: int) -> pd.DataFrame:
@@ -253,6 +254,54 @@ def test_num_ways_small_exhaustive() -> None:
         assert ways(df, recall, precision) == brute(recall, precision), (recall, precision)
 
 
+def test_sample_confusion_draws() -> None:
+    rng = np.random.default_rng(0)
+    pos_idx, neg_idx = sample_confusion_draws(10, 90, 5, 7, 200, rng)
+    assert pos_idx.shape == (200, 5) and neg_idx.shape == (200, 7)
+    for idx, pool in ((pos_idx, 10), (neg_idx, 90)):
+        assert idx.min() >= 0 and idx.max() < pool
+        # Without replacement within each draw.
+        assert all(len(set(row)) == len(row) for row in idx)
+
+    # Zero quotas and full-pool quotas.
+    pos_idx, neg_idx = sample_confusion_draws(10, 90, 0, 90, 3, rng)
+    assert pos_idx.shape == (3, 0) and neg_idx.shape == (3, 90)
+    assert all(sorted(row) == list(range(90)) for row in neg_idx)
+    pos_idx, neg_idx = sample_confusion_draws(4, 6, 4, 0, 3, rng)
+    assert all(sorted(row) == list(range(4)) for row in pos_idx)
+    pos_idx, neg_idx = sample_confusion_draws(10, 90, 5, 7, 0, rng)
+    assert pos_idx.shape == (0, 5) and neg_idx.shape == (0, 7)
+
+    # Same seed -> same draws; the blocked path draws the same way per row
+    # (each row consumes one pool-sized batch of keys either way).
+    a = sample_confusion_draws(10, 90, 5, 7, 50, np.random.default_rng(7))
+    b = sample_confusion_draws(10, 90, 5, 7, 50, np.random.default_rng(7))
+    c = sample_confusion_draws(
+        10, 90, 5, 7, 50, np.random.default_rng(7), max_block_elems=1
+    )
+    assert (a[0] == b[0]).all() and (a[1] == b[1]).all()
+    assert (a[0] == c[0]).all() and (a[1] == c[1]).all()
+
+    # Uniformity: every pool member should be picked ~ num_draws * k / pool.
+    pos_idx, _ = sample_confusion_draws(10, 0, 3, 0, 20000, np.random.default_rng(1))
+    counts = np.bincount(pos_idx.ravel(), minlength=10)
+    expected = 20000 * 3 / 10
+    assert (abs(counts - expected) < 5 * math.sqrt(expected)).all(), counts
+
+    # Quotas outside the pools are rejected.
+    for bad in ((11, 7), (5, 91), (-1, 7), (5, -1)):
+        try:
+            sample_confusion_draws(10, 90, *bad, 5, rng)
+            raise AssertionError(f"quotas {bad} should raise")
+        except ValueError:
+            pass
+    try:
+        sample_confusion_draws(10, 90, 5, 7, -1, rng)
+        raise AssertionError("negative num_draws should raise")
+    except ValueError:
+        pass
+
+
 def main() -> None:
     test_basic_feasible_selection()
     test_rounding_scheme()
@@ -261,6 +310,7 @@ def main() -> None:
     test_exclude_names()
     test_exclude_names_small_exhaustive()
     test_num_ways_small_exhaustive()
+    test_sample_confusion_draws()
     print("All simulate_model tests passed.")
 
 

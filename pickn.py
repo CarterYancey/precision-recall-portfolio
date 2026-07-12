@@ -53,7 +53,7 @@ import matplotlib.pyplot as plt
 # API key is read from ~/.nasdaq/data_link_apikey automatically.
 import nasdaqdatalink
 
-from simulate_model import SimulationResult, simulate_selection
+from simulate_model import SimulationResult, sample_confusion_draws, simulate_selection
 
 SP500_HISTORY_CSV = "data/SP500_history.csv"
 DEFAULT_CACHE_PATH = "data/cache/adj_close_cache.csv"
@@ -610,8 +610,8 @@ def simulate_custom_portfolio_distribution(
     rng: Optional[np.random.Generator] = None,
 ) -> Dict[str, float]:
     """
-    Run repeated simulate_selection calls for a given year and return distribution stats
-    for the model-selected portfolio returns.
+    Simulate many model selections for a given year and return distribution
+    stats for the model-selected portfolio returns.
 
     The hypothetical classifier labels a stock "positive" when its return exceeds
     `label_threshold` if given (a fixed absolute target, e.g. 0.1 for "picks stocks
@@ -647,24 +647,22 @@ def simulate_custom_portfolio_distribution(
         else []
     )
 
-    def draw_selection():
-        random_state = int(rng.integers(0, 2**31 - 1))
-        return simulate_selection(
-            df,
-            "ticker",
-            "label",
-            recall,
-            precision,
-            positive_label=positive_label,
-            random_state=random_state,
-            strict=False,
-            exclude_names=excluded_names,
-        )
-
-    # Achieved metrics depend only on the label counts (draws only vary which
-    # names are sampled), so a single probe tells us whether the requested
-    # (recall, precision) is reachable within tolerance for this year.
-    probe = draw_selection()
+    # Achieved metrics, the (tp, fp) quotas (including any infeasibility
+    # capping), and num_ways depend only on the label counts — draws only vary
+    # which names are sampled — so a single simulate_selection probe settles
+    # whether the requested (recall, precision) is reachable within tolerance
+    # for this year and how the remaining draws must be sized.
+    probe = simulate_selection(
+        df,
+        "ticker",
+        "label",
+        recall,
+        precision,
+        positive_label=positive_label,
+        random_state=int(rng.integers(0, 2**31 - 1)),
+        strict=False,
+        exclude_names=excluded_names,
+    )
     achieved_recall = probe.achieved_recall
     achieved_precision = probe.achieved_precision
     feasible = (
@@ -672,16 +670,45 @@ def simulate_custom_portfolio_distribution(
         and precision - 0.1 <= achieved_precision <= precision + 0.1
     )
 
-    returns = []
+    returns_arr = np.array([], dtype=float)
     if feasible:
-        returns.append(model_selected_portfolio_return(year_returns, probe.selected_names))
+        first = model_selected_portfolio_return(year_returns, probe.selected_names)
         # No point drawing more often than there are distinct selections.
         max_draws = min(num_simulations, probe.num_ways)
-        for _ in range(1, max_draws):
-            model_selection = draw_selection()
-            returns.append(model_selected_portfolio_return(year_returns, model_selection.selected_names))
+        extra_draws = max(0, max_draws - 1)
+        if extra_draws:
+            # Bulk-draw the remaining selections in numpy instead of repeating
+            # simulate_selection: the pools are the same rows it would sample
+            # (labeled positives/negatives minus exclusions) and the quotas are
+            # the probe's (tp, fp), so only the per-draw sampling is replaced.
+            pos_mask = labels == positive_label
+            in_pool = (
+                ~year_returns.index.astype(str).isin(excluded_names)
+                if excluded_names
+                else np.ones(len(year_returns), dtype=bool)
+            )
+            values = year_returns.to_numpy(dtype=float)
+            pos_pool = values[pos_mask & in_pool]
+            neg_pool = values[~pos_mask & in_pool]
+            pos_idx, neg_idx = sample_confusion_draws(
+                pos_pool.size, neg_pool.size, probe.tp, probe.fp, extra_draws, rng
+            )
+            picked_pos = pos_pool[pos_idx]
+            picked_neg = neg_pool[neg_idx]
+            # Equal-weight mean over the non-NaN picks, matching
+            # model_selected_portfolio_return (empty/all-NaN draws -> NaN).
+            totals = np.nansum(picked_pos, axis=1) + np.nansum(picked_neg, axis=1)
+            counts = (~np.isnan(picked_pos)).sum(axis=1) + (~np.isnan(picked_neg)).sum(axis=1)
+            draw_means = np.divide(
+                totals,
+                counts,
+                out=np.full(extra_draws, np.nan),
+                where=counts > 0,
+            )
+            returns_arr = np.concatenate([[first], draw_means])
+        else:
+            returns_arr = np.array([first], dtype=float)
 
-    returns_arr = np.array(returns, dtype=float)
     returns_arr = returns_arr[~np.isnan(returns_arr)]
     if returns_arr.size == 0:
         return {

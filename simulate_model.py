@@ -127,6 +127,48 @@ def estimate_num_ways(
     return math.comb(T_pool, tp) * math.comb(F_pool, fp)
 
 
+def sample_confusion_draws(
+    num_pos_pool: int,
+    num_neg_pool: int,
+    tp: int,
+    fp: int,
+    num_draws: int,
+    rng: np.random.Generator,
+    *,
+    max_block_elems: int = 4_000_000,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Bulk equivalent of repeated simulate_selection draws when only the sampled
+    names vary: `num_draws` independent selections of `tp` positives out of a
+    pool of `num_pos_pool` and `fp` negatives out of `num_neg_pool`, each drawn
+    uniformly without replacement (with replacement across draws).
+
+    Returns (pos_idx, neg_idx) integer index arrays of shape (num_draws, tp)
+    and (num_draws, fp); row i is the i-th selection. Sampling assigns each
+    pool member a uniform random key and takes the k smallest per row, blocked
+    so the key matrix never exceeds ~max_block_elems elements.
+    """
+    if not 0 <= tp <= num_pos_pool:
+        raise ValueError(f"tp={tp} outside pool of {num_pos_pool} positives.")
+    if not 0 <= fp <= num_neg_pool:
+        raise ValueError(f"fp={fp} outside pool of {num_neg_pool} negatives.")
+    if num_draws < 0:
+        raise ValueError(f"num_draws must be >= 0, got {num_draws}.")
+
+    def draw(pool_size: int, k: int) -> np.ndarray:
+        if k == 0:
+            return np.empty((num_draws, 0), dtype=np.intp)
+        out = np.empty((num_draws, k), dtype=np.intp)
+        block = max(1, max_block_elems // pool_size)
+        for lo in range(0, num_draws, block):
+            hi = min(num_draws, lo + block)
+            keys = rng.random((hi - lo, pool_size))
+            out[lo:hi] = np.argpartition(keys, k - 1, axis=1)[:, :k]
+        return out
+
+    return draw(num_pos_pool, tp), draw(num_neg_pool, fp)
+
+
 def simulate_selection(
     df: pd.DataFrame,
     name_col: str,
