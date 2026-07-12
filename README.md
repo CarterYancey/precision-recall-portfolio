@@ -58,7 +58,7 @@ uv run python pickn.py study --n-values 10 50 100 --year-start 2000 --year-end 2
     --recall 0.3 --precision 0.8 --num-simulations 2000 --seed 42
 ```
 
-Other useful flags: `--benchmark` (default SPY), `--label-threshold` (label stocks against a fixed absolute return instead of the year's benchmark), `--exclude-top` (see below), `--initial-investment` (growth-plot starting value), and `--no-plots`.
+Other useful flags: `--benchmark` (default SPY), `--label-threshold` (label stocks against a fixed absolute per-annum return instead of the benchmark's), `--exclude-top` (see below), `--horizon`/`--overlapping` (multi-year holding windows — see the dedicated section below), `--initial-investment` (growth-plot starting value), and `--no-plots`.
 
 **"Miss the super-performers" mode (`--exclude-top`).** Positive-class returns are heavily right-skewed: a few super-performers carry a large share of the positive-set mean, and a realistic model should not be credited with finding them. `--exclude-top` bars the best positives *by return* from the simulated model's picks — a value >= 1 is a count (top-K positives), a value in (0,1) a fraction of that year's positives (`0.1` = top decile). Excluded stocks still count toward recall's denominator (they become forced false negatives), so the TP quota is filled from ordinary criterion-meeting stocks only. The per-year excluded count appears as `excluded_top` in the yearly table (`excluded_top_mean` in the summary). The same run also simulates the **uniform-draw baseline** (no exclusion, same seed — so the two distributions differ only by the exclusion): the study prints a per-year comparison table (excluded vs uniform mean/q05 and the `mean_gap`), the summary gains `cagr_custom_{mean,q05,q95}_uniform`, `avg_custom_mean_return_uniform`, and `avg_custom_mean_gap`, both plots draw the uniform mean as a dotted line, and `StudyResult.custom_stats_uniform` carries the full per-year baseline. The gap measures how much of the apparent edge depends on catching outliers nobody should count on catching — no second run needed. For programmatic use — e.g. supplying `tickers_by_year` to override per-year membership, or a fixed `tickers` list for a static universe — call `run_top_n_study` directly.
 
@@ -70,7 +70,7 @@ The `sweep` subcommand evaluates a grid of (recall, precision) pairs, reporting 
 uv run python pickn.py sweep --recalls 0.1 0.2 0.3 --precisions 0.5 0.6 0.7 0.8 0.9
 ```
 
-The grid defaults to recalls `0.1 0.2 0.3` × precisions `0.5 0.6 0.7 0.8`, and the shared study flags (`--year-start`/`--year-end`, `--benchmark`, `--seed`, `--label-threshold`, `--exclude-top`, `--num-simulations`) apply here too — see `uv run python pickn.py sweep --help`. `--exclude-top` applies the "miss the super-performers" mode (see the study section) to every grid cell, with the average per-year excluded count reported as `excluded_top_mean`; each cell also runs the uniform-draw baseline with the same seed, adding `cagr_custom_q05_uniform`, `custom_q05_gap` (uniform minus excluded), and `custom_q05_meets_benchmark_uniform`/`custom_q05_meets_ew_benchmark_uniform` — so one sweep shows how much of the feasible region depends on catching outliers.
+The grid defaults to recalls `0.1 0.2 0.3` × precisions `0.5 0.6 0.7 0.8`, and the shared study flags (`--year-start`/`--year-end`, `--benchmark`, `--horizon`/`--overlapping`, `--seed`, `--label-threshold`, `--exclude-top`, `--num-simulations`) apply here too — see `uv run python pickn.py sweep --help`. `--exclude-top` applies the "miss the super-performers" mode (see the study section) to every grid cell, with the average per-year excluded count reported as `excluded_top_mean`; each cell also runs the uniform-draw baseline with the same seed, adding `cagr_custom_q05_uniform`, `custom_q05_gap` (uniform minus excluded), and `custom_q05_meets_benchmark_uniform`/`custom_q05_meets_ew_benchmark_uniform` — so one sweep shows how much of the feasible region depends on catching outliers.
 
 Each output row also carries the label base rate (`base_rate_mean/min/max` — prevalence `T/(T+F)`, identical across grid cells since it depends only on the labeling threshold) and `precision_edge_mean` (achieved precision minus base rate): "precision *p* suffices" is only evidence of a strong model where that edge is large, and with a fixed absolute `--label-threshold` the base rate collapses in bear years, which the per-year column in `custom_stats` makes visible.
 
@@ -85,6 +85,22 @@ uv run python pickn.py screen --criteria 0 0.1 bmk bmk+0.1
 ```
 
 Criterion specs are absolute return thresholds (`0`, `0.1` for >10%) or benchmark-relative (`bmk`, `bmk+0.1`, `bmk-0.05`); `bmk` always refers to the cap-weighted benchmark. The command prints a per-year table (criterion × {threshold, positives, base rate, positive-set mean return, both benchmark returns, excess vs each}, also written to `Criterion_Feasibility.csv`, override with `--output`) and a per-criterion summary with `cagr_perfect` vs `cagr_benchmark` and `cagr_ew_benchmark`, plus paired verdicts: `passes_screen` (beats cap-weighted SPY) and `passes_screen_ew` (beats the equal-weighted universe mean — the perfect portfolio is itself equal-weighted, so only this one isolates selection value from the weighting scheme). Passing is a **necessary condition only**: a low-recall draw centers on the same mean but with real variance, and right-skewed positive returns put the typical draw below it — the risk analysis starts where the screen ends. This needs no selection simulation, so it's fast once prices are cached.
+
+## Multi-year holding horizons (`--horizon`, `--overlapping`)
+
+All three subcommands accept `--horizon H` to study criteria like ">0% annual returns over the next 3 years" instead of single calendar years. Each cohort is formed at the start of a **formation year** — membership is the S&P 500 snapshot in force at formation, exactly as before — and held **buy-and-hold** through year formation+H−1: returns run from the formation year's first trading day to the window's last, and stocks that delist inside the window are kept at their last available price (the same rule that covers mid-year delistings at horizon 1; they show up under `partial_year` in the coverage report). All per-"year" tables become per-window tables indexed by formation year.
+
+```bash
+uv run python pickn.py screen --horizon 3 --criteria 0 0.1 bmk       # ">X% annual over 3 years"
+uv run python pickn.py sweep  --horizon 3 --overlapping --recalls 0.2 --precisions 0.6 0.8
+```
+
+Two window schemes are available:
+
+- **Non-overlapping (default):** formation years step by H (e.g. 2012, 2015, 2018, … for H=3), so chaining the window returns is a realizable "rebalance every H years" path and the reported CAGRs are path CAGRs.
+- **`--overlapping`:** a cohort forms every year (rolling windows). More sample windows, but consecutive windows share H−1 calendar years, so the cohorts are autocorrelated: CAGRs are then geometric means of annualized per-cohort returns — a summary statistic, not a realizable single path — and the study skips the growth-of-$100 plot for that reason.
+
+Thresholds stay **per-annum** everywhere and are compounded internally: `--label-threshold 0.1 --horizon 3` labels stocks returning more than 1.1³−1 ≈ 33.1% over the window, and screen criteria work the same way (`bmk±offset` adds the offset to the benchmark's *annualized* window return before compounding back). All CAGR columns are annualized by the horizon, so results at different horizons are directly comparable. `--horizon 1` (the default) reproduces the original calendar-year study exactly.
 
 ## Simulating recall/precision selections
 
